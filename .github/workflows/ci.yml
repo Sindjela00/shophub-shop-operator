@@ -1,0 +1,14 @@
+# CI pipeline placeholder — triggered on every PR against develop/master.
+# TODO:
+#   - go build / go vet / go test (unit + envtest integration tests)
+#   - build & publish operator image (semantic versioning) on merge
+#   - require this pipeline to pass before a PR can be merged
+name: CI
+on:
+  pull_request:
+    branches: [develop, master]
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4

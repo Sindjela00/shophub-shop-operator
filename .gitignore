@@ -1,0 +1,14 @@
+# Go
+bin/
+*.exe
+vendor/
+
+# Build artifacts
+/manager
+
+# IDE
+.vscode/
+.idea/
+
+# Env
+.env
