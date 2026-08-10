@@ -1,0 +1,52 @@
+# Hand-written stand-in for what `controller-gen crd` would generate from
+# api/v1/discordchannel_types.go — regenerate and replace once Go/kubebuilder are installed.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: discordchannels.apps.shophub.io
+spec:
+  group: apps.shophub.io
+  names:
+    kind: DiscordChannel
+    listKind: DiscordChannelList
+    plural: discordchannels
+    singular: discordchannel
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Shop
+          type: string
+          jsonPath: .spec.shopRef
+        - name: Channel
+          type: string
+          jsonPath: .spec.channelName
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [shopRef, channelName]
+              properties:
+                shopRef:
+                  type: string
+                  minLength: 1
+                channelName:
+                  type: string
+                  minLength: 1
+            status:
+              type: object
+              properties:
+                channelId:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
