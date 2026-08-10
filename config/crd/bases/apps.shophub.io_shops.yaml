@@ -1,0 +1,64 @@
+# Hand-written stand-in for what `controller-gen crd` (via `make manifests`) would
+# generate from the +kubebuilder markers in api/v1/shop_types.go — regenerate and replace
+# once Go/kubebuilder are installed. Kept in sync with that file by hand for now.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: shops.apps.shophub.io
+spec:
+  group: apps.shophub.io
+  names:
+    kind: Shop
+    listKind: ShopList
+    plural: shops
+    singular: shop
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Availability
+          type: string
+          jsonPath: .spec.availability
+        - name: Database
+          type: string
+          jsonPath: .spec.databaseKind
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [name, walletAddress]
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                availability:
+                  type: string
+                  enum: [standard, high]
+                  default: standard
+                walletAddress:
+                  type: string
+                  minLength: 1
+                databaseKind:
+                  type: string
+                  enum: [standard, light]
+                  default: standard
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
