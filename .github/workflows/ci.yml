@@ -1,14 +1,56 @@
-# CI pipeline placeholder — triggered on every PR against develop/master.
-# TODO:
+# CI pipeline — triggered on every PR against develop/master, and publishes an operator
+# image to GHCR on merge to master.
+# TODO (tracked in the "Testing & CI" issue):
 #   - go build / go vet / go test (unit + envtest integration tests)
-#   - build & publish operator image (semantic versioning) on merge
-#   - require this pipeline to pass before a PR can be merged
 name: CI
 on:
   pull_request:
     branches: [develop, master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+  publish-image:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
