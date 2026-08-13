@@ -1,7 +1,5 @@
 # CI pipeline — triggered on every PR against develop/master, and publishes an operator
 # image to GHCR on merge to master.
-# TODO (tracked in the "Testing & CI" issue):
-#   - envtest-based integration tests against a real (ephemeral) API server
 name: CI
 on:
   pull_request:
@@ -34,8 +32,19 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test ./...
+      - name: Unit tests
+        run: go test $(go list ./... | grep -v /test/integration)
+
+      # envtest downloads a real (ephemeral) etcd + kube-apiserver pair — no full cluster, but
+      # a genuine API server, so test/integration exercises real CRD validation and the real
+      # controller-runtime watch/cache machinery instead of the fake client the unit tests use.
+      - name: Setup envtest binaries
+        run: |
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.19
+          echo "KUBEBUILDER_ASSETS=$(setup-envtest use 1.31.0 -p path)" >> "$GITHUB_ENV"
+
+      - name: Integration tests (envtest)
+        run: go test ./test/integration/...
 
   publish-image:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
