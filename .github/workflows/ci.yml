@@ -1,7 +1,7 @@
 # CI pipeline — triggered on every PR against develop/master, and publishes an operator
 # image to GHCR on merge to master.
 # TODO (tracked in the "Testing & CI" issue):
-#   - go build / go vet / go test (unit + envtest integration tests)
+#   - envtest-based integration tests against a real (ephemeral) API server
 name: CI
 on:
   pull_request:
@@ -22,6 +22,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
 
   publish-image:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
