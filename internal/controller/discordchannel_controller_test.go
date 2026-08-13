@@ -1,0 +1,223 @@
+package controller
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	shopv1 "github.com/shophub/shophub-shop-operator/api/v1"
+	"github.com/shophub/shophub-shop-operator/internal/discord"
+)
+
+// recordingDiscordTransport is a minimal fake Discord API: it tracks channel state in memory
+// (keyed by name) and records every request, so tests can assert both the outcome and exactly
+// which calls the reconciler made.
+type recordingDiscordTransport struct {
+	channels map[string]discord.Channel // by ID
+	nextID   int
+	Requests []string // "METHOD path" for each call
+}
+
+func newRecordingDiscordTransport() *recordingDiscordTransport {
+	return &recordingDiscordTransport{channels: map[string]discord.Channel{}}
+}
+
+func (f *recordingDiscordTransport) seedChannel(name string) discord.Channel {
+	f.nextID++
+	id := strconv.Itoa(f.nextID)
+	ch := discord.Channel{ID: id, Name: name, Type: discord.GuildTextChannelType}
+	f.channels[id] = ch
+	return ch
+}
+
+func (f *recordingDiscordTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.Requests = append(f.Requests, req.Method+" "+req.URL.Path)
+
+	switch {
+	case req.Method == http.MethodGet && req.URL.Path == "/api/v10/guilds/test-guild/channels":
+		list := make([]discord.Channel, 0, len(f.channels))
+		for _, ch := range f.channels {
+			list = append(list, ch)
+		}
+		return jsonResp(http.StatusOK, list), nil
+
+	case req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/api/v10/channels/"):
+		id := strings.TrimPrefix(req.URL.Path, "/api/v10/channels/")
+		if ch, ok := f.channels[id]; ok {
+			return jsonResp(http.StatusOK, ch), nil
+		}
+		return jsonResp(http.StatusNotFound, map[string]string{"message": "Unknown Channel"}), nil
+
+	case req.Method == http.MethodPost && req.URL.Path == "/api/v10/guilds/test-guild/channels":
+		var body struct {
+			Name string `json:"name"`
+		}
+		raw, _ := io.ReadAll(req.Body)
+		_ = json.Unmarshal(raw, &body)
+		ch := f.seedChannel(body.Name)
+		return jsonResp(http.StatusCreated, ch), nil
+
+	case req.Method == http.MethodDelete && strings.HasPrefix(req.URL.Path, "/api/v10/channels/"):
+		id := strings.TrimPrefix(req.URL.Path, "/api/v10/channels/")
+		if _, ok := f.channels[id]; !ok {
+			return jsonResp(http.StatusNotFound, map[string]string{"message": "Unknown Channel"}), nil
+		}
+		delete(f.channels, id)
+		return jsonResp(http.StatusNoContent, nil), nil
+	}
+
+	return jsonResp(http.StatusNotImplemented, map[string]string{"message": "unhandled in test fake"}), nil
+}
+
+func jsonResp(status int, body any) *http.Response {
+	data, _ := json.Marshal(body)
+	return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(string(data)))}
+}
+
+func newDiscordReconciler(t *testing.T, transport *recordingDiscordTransport, dc *shopv1.DiscordChannel) (*DiscordChannelReconciler, client.Client) {
+	t.Helper()
+	scheme := newTestScheme(t)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(dc).
+		WithStatusSubresource(&shopv1.DiscordChannel{}).
+		Build()
+
+	discordClient := &discord.Client{
+		HTTPClient: &http.Client{Transport: transport},
+		BotToken:   "test-token",
+		GuildID:    "test-guild",
+	}
+
+	r := &DiscordChannelReconciler{Client: fakeClient, Scheme: scheme, Discord: discordClient}
+	return r, fakeClient
+}
+
+func reconcileDiscordChannel(t *testing.T, r *DiscordChannelReconciler, name string) {
+	t.Helper()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: "shops"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile returned error: %v", err)
+	}
+}
+
+func newDiscordChannel() *shopv1.DiscordChannel {
+	return &shopv1.DiscordChannel{
+		ObjectMeta: metav1.ObjectMeta{Name: "shop-1", Namespace: "shops"},
+		Spec:       shopv1.DiscordChannelSpec{ShopRef: "shop-1", ChannelName: "Aurora Shop"},
+	}
+}
+
+func TestDiscordChannelReconciler_createsChannelAndRecordsID(t *testing.T) {
+	transport := newRecordingDiscordTransport()
+	dc := newDiscordChannel()
+	r, fakeClient := newDiscordReconciler(t, transport, dc)
+
+	reconcileDiscordChannel(t, r, "shop-1")
+
+	var got shopv1.DiscordChannel
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1", Namespace: "shops"}, &got); err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if got.Status.ChannelID == "" {
+		t.Error("status.channelId was not set")
+	}
+	if !controllerutil.ContainsFinalizer(&got, discordChannelFinalizer) {
+		t.Error("finalizer was not added")
+	}
+	cond := findCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Errorf("Ready condition = %+v, want True", cond)
+	}
+
+	createCalls := 0
+	for _, req := range transport.Requests {
+		if req == "POST /api/v10/guilds/test-guild/channels" {
+			createCalls++
+		}
+	}
+	if createCalls != 1 {
+		t.Errorf("CreateChannel called %d times, want 1", createCalls)
+	}
+}
+
+func TestDiscordChannelReconciler_isIdempotentWhenChannelAlreadyRecorded(t *testing.T) {
+	transport := newRecordingDiscordTransport()
+	existing := transport.seedChannel("aurora-shop")
+
+	dc := newDiscordChannel()
+	dc.Status.ChannelID = existing.ID
+	controllerutil.AddFinalizer(dc, discordChannelFinalizer)
+
+	r, _ := newDiscordReconciler(t, transport, dc)
+	reconcileDiscordChannel(t, r, "shop-1")
+
+	for _, req := range transport.Requests {
+		if req == "POST /api/v10/guilds/test-guild/channels" {
+			t.Errorf("expected no channel creation when status.channelId already points at a live channel, but got: %v", transport.Requests)
+		}
+	}
+}
+
+func TestDiscordChannelReconciler_findsExistingChannelByNameInsteadOfDuplicating(t *testing.T) {
+	transport := newRecordingDiscordTransport()
+	transport.seedChannel("aurora-shop") // exists, but not yet recorded in status (simulates a prior partial failure)
+
+	dc := newDiscordChannel()
+	r, fakeClient := newDiscordReconciler(t, transport, dc)
+	reconcileDiscordChannel(t, r, "shop-1")
+
+	var got shopv1.DiscordChannel
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1", Namespace: "shops"}, &got); err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if got.Status.ChannelID != "1" {
+		t.Errorf("status.channelId = %q, want the pre-existing channel's id (1)", got.Status.ChannelID)
+	}
+
+	for _, req := range transport.Requests {
+		if req == "POST /api/v10/guilds/test-guild/channels" {
+			t.Errorf("expected no channel creation when one with the same name already exists, but got: %v", transport.Requests)
+		}
+	}
+}
+
+func TestDiscordChannelReconciler_deletesTheChannelWhenTheCRIsDeleted(t *testing.T) {
+	transport := newRecordingDiscordTransport()
+	existing := transport.seedChannel("aurora-shop")
+
+	dc := newDiscordChannel()
+	dc.Status.ChannelID = existing.ID
+	controllerutil.AddFinalizer(dc, discordChannelFinalizer)
+
+	r, fakeClient := newDiscordReconciler(t, transport, dc)
+
+	// Real delete request: with the finalizer present, the fake client (like a real API
+	// server) keeps the object around with a DeletionTimestamp set instead of removing it.
+	if err := fakeClient.Delete(context.Background(), dc); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+
+	reconcileDiscordChannel(t, r, "shop-1")
+
+	if _, ok := transport.channels[existing.ID]; ok {
+		t.Error("channel was not deleted from Discord")
+	}
+
+	var got shopv1.DiscordChannel
+	err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1", Namespace: "shops"}, &got)
+	if err == nil {
+		t.Error("expected the DiscordChannel to be gone once the finalizer was removed, but it still exists")
+	}
+}
