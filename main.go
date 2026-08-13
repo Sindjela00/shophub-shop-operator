@@ -18,6 +18,9 @@ import (
 	"github.com/shophub/shophub-shop-operator/internal/discord"
 )
 
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+
 var scheme = runtime.NewScheme()
 
 func init() {
