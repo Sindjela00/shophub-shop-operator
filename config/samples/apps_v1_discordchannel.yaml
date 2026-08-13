@@ -1,0 +1,8 @@
+apiVersion: apps.shophub.io/v1
+kind: DiscordChannel
+metadata:
+  name: aurora-shop
+  namespace: shops
+spec:
+  shopRef: aurora-shop
+  channelName: "Aurora Shop"

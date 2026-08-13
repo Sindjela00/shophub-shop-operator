@@ -1,0 +1,4 @@
+resources:
+- apps_v1_shop.yaml
+- apps_v1_wallet.yaml
+- apps_v1_discordchannel.yaml
