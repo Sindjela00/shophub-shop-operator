@@ -1,0 +1,8 @@
+apiVersion: apps.shophub.io/v1
+kind: Wallet
+metadata:
+  name: aurora-shop
+  namespace: shops
+spec:
+  shopRef: aurora-shop
+  address: "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"

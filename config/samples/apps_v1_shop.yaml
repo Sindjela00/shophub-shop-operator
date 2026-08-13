@@ -1,0 +1,10 @@
+apiVersion: apps.shophub.io/v1
+kind: Shop
+metadata:
+  name: aurora-shop
+  namespace: shops
+spec:
+  name: "Aurora Shop"
+  availability: standard
+  walletAddress: "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+  databaseKind: standard
