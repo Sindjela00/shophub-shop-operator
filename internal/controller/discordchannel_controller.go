@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,6 +32,11 @@ type DiscordChannelReconciler struct {
 
 // +kubebuilder:rbac:groups=apps.shophub.io,resources=discordchannels,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=apps.shophub.io,resources=discordchannels/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
+
+func webhookSecretName(dc *shopv1.DiscordChannel) string {
+	return dc.Name + "-discord-webhook"
+}
 
 func (r *DiscordChannelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -55,50 +61,88 @@ func (r *DiscordChannelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// Idempotent: if we already recorded a channel ID, confirm it's still there rather than
 	// blindly assuming a new one is needed (e.g. after a manager restart).
+	var channel *discord.Channel
 	if dc.Status.ChannelID != "" {
 		existing, err := r.Discord.GetChannel(ctx, dc.Status.ChannelID)
 		if err != nil {
 			return r.markFailed(ctx, &dc, err)
 		}
-		if existing != nil {
-			return ctrl.Result{}, nil
-		}
-		// Recorded channel is gone (deleted out-of-band) — fall through and recreate it.
+		channel = existing
+		// If nil, the recorded channel is gone (deleted out-of-band) — fall through and
+		// recreate it below.
 	}
 
-	// Guard against duplicate creation if a previous reconcile created the channel but failed
-	// before persisting status.channelId.
-	found, err := r.Discord.FindChannelByName(ctx, name)
+	if channel == nil {
+		// Guard against duplicate creation if a previous reconcile created the channel but
+		// failed before persisting status.channelId.
+		found, err := r.Discord.FindChannelByName(ctx, name)
+		if err != nil {
+			return r.markFailed(ctx, &dc, err)
+		}
+		channel = found
+		if channel == nil {
+			channel, err = r.Discord.CreateChannel(ctx, name)
+			if err != nil {
+				return r.markFailed(ctx, &dc, err)
+			}
+		}
+	}
+
+	// Same idempotency pattern for the webhook Alertmanager will post through: look it up by
+	// name before creating, so repeated reconciles never pile up duplicate webhooks.
+	webhook, err := r.Discord.FindChannelWebhookByName(ctx, channel.ID, name)
 	if err != nil {
 		return r.markFailed(ctx, &dc, err)
 	}
-
-	channel := found
-	if channel == nil {
-		channel, err = r.Discord.CreateChannel(ctx, name)
+	if webhook == nil {
+		webhook, err = r.Discord.CreateChannelWebhook(ctx, channel.ID, name)
 		if err != nil {
 			return r.markFailed(ctx, &dc, err)
 		}
 	}
 
+	// The webhook URL embeds a secret token, so it goes in a Secret rather than the CR's
+	// status (which isn't access-controlled the same way). Owning it via the DiscordChannel CR
+	// means it's garbage-collected automatically when the CR goes away.
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: webhookSecretName(&dc), Namespace: dc.Namespace},
+	}
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
+		if secret.Data == nil {
+			secret.Data = map[string][]byte{}
+		}
+		secret.Data["webhookUrl"] = []byte(webhook.URL())
+		return controllerutil.SetControllerReference(&dc, secret, r.Scheme)
+	}); err != nil {
+		return r.markFailed(ctx, &dc, err)
+	}
+
 	dc.Status.ChannelID = channel.ID
+	dc.Status.WebhookID = webhook.ID
+	dc.Status.WebhookSecretRef = secret.Name
 	apimeta.SetStatusCondition(&dc.Status.Conditions, metav1.Condition{
 		Type:    "Ready",
 		Status:  metav1.ConditionTrue,
 		Reason:  "ChannelProvisioned",
-		Message: fmt.Sprintf("Discord channel #%s is provisioned.", name),
+		Message: fmt.Sprintf("Discord channel #%s and its alert webhook are provisioned.", name),
 	})
 	if err := r.Status().Update(ctx, &dc); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("provisioned discord channel", "channel", name, "channelId", channel.ID)
+	logger.Info("provisioned discord channel and webhook", "channel", name, "channelId", channel.ID, "webhookId", webhook.ID)
 	return ctrl.Result{}, nil
 }
 
 func (r *DiscordChannelReconciler) reconcileDelete(ctx context.Context, dc *shopv1.DiscordChannel) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(dc, discordChannelFinalizer) {
 		return ctrl.Result{}, nil
+	}
+
+	if dc.Status.WebhookID != "" {
+		if err := r.Discord.DeleteWebhook(ctx, dc.Status.WebhookID); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	if dc.Status.ChannelID != "" {
@@ -131,5 +175,6 @@ func (r *DiscordChannelReconciler) markFailed(ctx context.Context, dc *shopv1.Di
 func (r *DiscordChannelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&shopv1.DiscordChannel{}).
+		Owns(&corev1.Secret{}).
 		Complete(r)
 }

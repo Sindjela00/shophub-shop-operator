@@ -175,3 +175,113 @@ func TestDeleteChannel_propagatesOtherErrors(t *testing.T) {
 		t.Error("expected an error, got nil")
 	}
 }
+
+func TestWebhook_URL(t *testing.T) {
+	wh := Webhook{ID: "123", Token: "sekrit"}
+	want := "https://discord.com/api/v10/webhooks/123/sekrit"
+	if got := wh.URL(); got != want {
+		t.Errorf("URL() = %q, want %q", got, want)
+	}
+}
+
+func TestCreateChannelWebhook_sendsCorrectRequestAndParsesResponse(t *testing.T) {
+	var capturedReq *http.Request
+	var capturedBody []byte
+
+	client := newTestClient(func(req *http.Request) (*http.Response, error) {
+		capturedReq = req
+		capturedBody, _ = io.ReadAll(req.Body)
+		return jsonResponse(http.StatusOK, `{"id":"999","token":"tok-999","name":"aurora-shop"}`), nil
+	})
+
+	wh, err := client.CreateChannelWebhook(context.Background(), "42", "aurora-shop")
+	if err != nil {
+		t.Fatalf("CreateChannelWebhook returned error: %v", err)
+	}
+	if wh.ID != "999" || wh.Token != "tok-999" || wh.Name != "aurora-shop" {
+		t.Errorf("CreateChannelWebhook result = %+v, want id=999 token=tok-999 name=aurora-shop", wh)
+	}
+
+	if capturedReq.Method != http.MethodPost {
+		t.Errorf("method = %s, want POST", capturedReq.Method)
+	}
+	if capturedReq.URL.String() != "https://discord.com/api/v10/channels/42/webhooks" {
+		t.Errorf("url = %s, want /channels/42/webhooks", capturedReq.URL.String())
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(capturedBody, &body); err != nil {
+		t.Fatalf("request body isn't valid JSON: %v", err)
+	}
+	if body["name"] != "aurora-shop" {
+		t.Errorf("request body name = %v, want aurora-shop", body["name"])
+	}
+}
+
+func TestCreateChannelWebhook_returnsStatusErrorOnFailure(t *testing.T) {
+	client := newTestClient(func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusForbidden, `{"message":"Missing Permissions","code":50013}`), nil
+	})
+
+	_, err := client.CreateChannelWebhook(context.Background(), "42", "aurora-shop")
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if _, ok := err.(*StatusError); !ok {
+		t.Fatalf("error type = %T, want *StatusError", err)
+	}
+}
+
+func TestFindChannelWebhookByName_findsMatchingWebhook(t *testing.T) {
+	client := newTestClient(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodGet || req.URL.Path != "/api/v10/channels/42/webhooks" {
+			t.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
+		}
+		return jsonResponse(http.StatusOK, `[{"id":"1","token":"t1","name":"other-shop"},{"id":"2","token":"t2","name":"aurora-shop"}]`), nil
+	})
+
+	wh, err := client.FindChannelWebhookByName(context.Background(), "42", "aurora-shop")
+	if err != nil {
+		t.Fatalf("FindChannelWebhookByName returned error: %v", err)
+	}
+	if wh == nil || wh.ID != "2" {
+		t.Errorf("FindChannelWebhookByName result = %+v, want id=2", wh)
+	}
+}
+
+func TestFindChannelWebhookByName_returnsNilWhenNotFound(t *testing.T) {
+	client := newTestClient(func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, `[{"id":"1","token":"t1","name":"other-shop"}]`), nil
+	})
+
+	wh, err := client.FindChannelWebhookByName(context.Background(), "42", "aurora-shop")
+	if err != nil {
+		t.Fatalf("FindChannelWebhookByName returned error: %v", err)
+	}
+	if wh != nil {
+		t.Errorf("FindChannelWebhookByName result = %+v, want nil", wh)
+	}
+}
+
+func TestDeleteWebhook_treatsNotFoundAsSuccess(t *testing.T) {
+	client := newTestClient(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodDelete {
+			t.Errorf("method = %s, want DELETE", req.Method)
+		}
+		return jsonResponse(http.StatusNotFound, `{"message":"Unknown Webhook","code":10015}`), nil
+	})
+
+	if err := client.DeleteWebhook(context.Background(), "already-gone"); err != nil {
+		t.Errorf("DeleteWebhook returned error: %v, want nil (404 is not an error)", err)
+	}
+}
+
+func TestDeleteWebhook_propagatesOtherErrors(t *testing.T) {
+	client := newTestClient(func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusInternalServerError, `{"message":"internal error"}`), nil
+	})
+
+	if err := client.DeleteWebhook(context.Background(), "id"); err == nil {
+		t.Error("expected an error, got nil")
+	}
+}
