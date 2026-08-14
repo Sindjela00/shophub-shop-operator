@@ -17,11 +17,21 @@ type DiscordChannelSpec struct {
 }
 
 // DiscordChannelStatus defines the observed state of DiscordChannel.
-// TODO: ChannelID/WebhookURL populated by the (not yet implemented) DiscordChannel
-// controller once it actually creates the channel via the Discord API/bot.
 type DiscordChannelStatus struct {
 	// +optional
 	ChannelID string `json:"channelId,omitempty"`
+
+	// WebhookID is the Discord webhook backing this channel's alert notifications. It is not
+	// sensitive on its own (unlike the webhook's token/URL, which lives in the Secret named by
+	// WebhookSecretRef) and is kept here so the controller can delete the webhook on cleanup.
+	// +optional
+	WebhookID string `json:"webhookId,omitempty"`
+
+	// WebhookSecretRef is the name, in the same namespace, of the Secret holding this channel's
+	// webhook URL (key "webhookUrl") — e.g. for Alertmanager to reference. The URL itself is
+	// never stored here since it embeds the webhook's secret token.
+	// +optional
+	WebhookSecretRef string `json:"webhookSecretRef,omitempty"`
 
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

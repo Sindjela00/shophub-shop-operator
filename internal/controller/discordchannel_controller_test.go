@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -20,17 +21,23 @@ import (
 	"github.com/shophub/shophub-shop-operator/internal/discord"
 )
 
-// recordingDiscordTransport is a minimal fake Discord API: it tracks channel state in memory
-// (keyed by name) and records every request, so tests can assert both the outcome and exactly
-// which calls the reconciler made.
+// recordingDiscordTransport is a minimal fake Discord API: it tracks channel and webhook state
+// in memory (keyed by ID) and records every request, so tests can assert both the outcome and
+// exactly which calls the reconciler made.
 type recordingDiscordTransport struct {
-	channels map[string]discord.Channel // by ID
-	nextID   int
-	Requests []string // "METHOD path" for each call
+	channels        map[string]discord.Channel // by ID
+	webhooks        map[string]discord.Webhook // by ID
+	webhookChannels map[string]string          // webhook ID -> owning channel ID
+	nextID          int
+	Requests        []string // "METHOD path" for each call
 }
 
 func newRecordingDiscordTransport() *recordingDiscordTransport {
-	return &recordingDiscordTransport{channels: map[string]discord.Channel{}}
+	return &recordingDiscordTransport{
+		channels:        map[string]discord.Channel{},
+		webhooks:        map[string]discord.Webhook{},
+		webhookChannels: map[string]string{},
+	}
 }
 
 func (f *recordingDiscordTransport) seedChannel(name string) discord.Channel {
@@ -39,6 +46,15 @@ func (f *recordingDiscordTransport) seedChannel(name string) discord.Channel {
 	ch := discord.Channel{ID: id, Name: name, Type: discord.GuildTextChannelType}
 	f.channels[id] = ch
 	return ch
+}
+
+func (f *recordingDiscordTransport) seedWebhook(channelID, name string) discord.Webhook {
+	f.nextID++
+	id := strconv.Itoa(f.nextID)
+	wh := discord.Webhook{ID: id, Token: "tok-" + id, Name: name}
+	f.webhooks[id] = wh
+	f.webhookChannels[id] = channelID
+	return wh
 }
 
 func (f *recordingDiscordTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -51,6 +67,35 @@ func (f *recordingDiscordTransport) RoundTrip(req *http.Request) (*http.Response
 			list = append(list, ch)
 		}
 		return jsonResp(http.StatusOK, list), nil
+
+	case req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/api/v10/channels/") && strings.HasSuffix(req.URL.Path, "/webhooks"):
+		channelID := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/api/v10/channels/"), "/webhooks")
+		list := make([]discord.Webhook, 0)
+		for id, wh := range f.webhooks {
+			if f.webhookChannels[id] == channelID {
+				list = append(list, wh)
+			}
+		}
+		return jsonResp(http.StatusOK, list), nil
+
+	case req.Method == http.MethodPost && strings.HasPrefix(req.URL.Path, "/api/v10/channels/") && strings.HasSuffix(req.URL.Path, "/webhooks"):
+		channelID := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/api/v10/channels/"), "/webhooks")
+		var body struct {
+			Name string `json:"name"`
+		}
+		raw, _ := io.ReadAll(req.Body)
+		_ = json.Unmarshal(raw, &body)
+		wh := f.seedWebhook(channelID, body.Name)
+		return jsonResp(http.StatusCreated, wh), nil
+
+	case req.Method == http.MethodDelete && strings.HasPrefix(req.URL.Path, "/api/v10/webhooks/"):
+		id := strings.TrimPrefix(req.URL.Path, "/api/v10/webhooks/")
+		if _, ok := f.webhooks[id]; !ok {
+			return jsonResp(http.StatusNotFound, map[string]string{"message": "Unknown Webhook"}), nil
+		}
+		delete(f.webhooks, id)
+		delete(f.webhookChannels, id)
+		return jsonResp(http.StatusNoContent, nil), nil
 
 	case req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/api/v10/channels/"):
 		id := strings.TrimPrefix(req.URL.Path, "/api/v10/channels/")
@@ -87,7 +132,7 @@ func jsonResp(status int, body any) *http.Response {
 
 func newDiscordReconciler(t *testing.T, transport *recordingDiscordTransport, dc *shopv1.DiscordChannel) (*DiscordChannelReconciler, client.Client) {
 	t.Helper()
-	scheme := newTestScheme(t)
+	scheme := newShopTestScheme(t)
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(dc).
@@ -196,9 +241,11 @@ func TestDiscordChannelReconciler_findsExistingChannelByNameInsteadOfDuplicating
 func TestDiscordChannelReconciler_deletesTheChannelWhenTheCRIsDeleted(t *testing.T) {
 	transport := newRecordingDiscordTransport()
 	existing := transport.seedChannel("aurora-shop")
+	wh := transport.seedWebhook(existing.ID, "aurora-shop")
 
 	dc := newDiscordChannel()
 	dc.Status.ChannelID = existing.ID
+	dc.Status.WebhookID = wh.ID
 	controllerutil.AddFinalizer(dc, discordChannelFinalizer)
 
 	r, fakeClient := newDiscordReconciler(t, transport, dc)
@@ -214,10 +261,69 @@ func TestDiscordChannelReconciler_deletesTheChannelWhenTheCRIsDeleted(t *testing
 	if _, ok := transport.channels[existing.ID]; ok {
 		t.Error("channel was not deleted from Discord")
 	}
+	if _, ok := transport.webhooks[wh.ID]; ok {
+		t.Error("webhook was not deleted from Discord")
+	}
 
 	var got shopv1.DiscordChannel
 	err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1", Namespace: "shops"}, &got)
 	if err == nil {
 		t.Error("expected the DiscordChannel to be gone once the finalizer was removed, but it still exists")
+	}
+}
+
+func TestDiscordChannelReconciler_createsWebhookAndStoresURLInSecret(t *testing.T) {
+	transport := newRecordingDiscordTransport()
+	dc := newDiscordChannel()
+	r, fakeClient := newDiscordReconciler(t, transport, dc)
+
+	reconcileDiscordChannel(t, r, "shop-1")
+
+	var got shopv1.DiscordChannel
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1", Namespace: "shops"}, &got); err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if got.Status.WebhookID == "" {
+		t.Error("status.webhookId was not set")
+	}
+	if got.Status.WebhookSecretRef == "" {
+		t.Fatal("status.webhookSecretRef was not set")
+	}
+
+	var secret corev1.Secret
+	secretKey := types.NamespacedName{Name: got.Status.WebhookSecretRef, Namespace: "shops"}
+	if err := fakeClient.Get(context.Background(), secretKey, &secret); err != nil {
+		t.Fatalf("expected Secret %s to exist, got error: %v", secretKey, err)
+	}
+	url, ok := secret.Data["webhookUrl"]
+	if !ok || len(url) == 0 {
+		t.Error("Secret did not contain a non-empty webhookUrl key")
+	}
+	if !strings.Contains(string(url), got.Status.WebhookID) {
+		t.Errorf("webhookUrl %q does not reference webhook ID %q", url, got.Status.WebhookID)
+	}
+
+	if len(secret.OwnerReferences) != 1 || secret.OwnerReferences[0].Name != got.Name {
+		t.Errorf("Secret owner references = %+v, want a single owner reference to %q", secret.OwnerReferences, got.Name)
+	}
+}
+
+func TestDiscordChannelReconciler_isIdempotentForWebhookCreationAcrossReconciles(t *testing.T) {
+	transport := newRecordingDiscordTransport()
+	dc := newDiscordChannel()
+	r, _ := newDiscordReconciler(t, transport, dc)
+
+	reconcileDiscordChannel(t, r, "shop-1")
+	reconcileDiscordChannel(t, r, "shop-1")
+	reconcileDiscordChannel(t, r, "shop-1")
+
+	webhookCreates := 0
+	for _, req := range transport.Requests {
+		if req == "POST /api/v10/channels/1/webhooks" {
+			webhookCreates++
+		}
+	}
+	if webhookCreates != 1 {
+		t.Errorf("webhook created %d times across repeated reconciles, want 1: %v", webhookCreates, transport.Requests)
 	}
 }

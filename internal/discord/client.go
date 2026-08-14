@@ -131,6 +131,76 @@ func (c *Client) DeleteChannel(ctx context.Context, id string) error {
 	return err
 }
 
+// Webhook is the subset of Discord's webhook object this client cares about. Token is only
+// populated for webhooks the requesting bot itself created — Discord omits it when listing
+// webhooks the bot doesn't own, which is fine here since this client only ever looks for
+// webhooks it created itself.
+type Webhook struct {
+	ID    string `json:"id"`
+	Token string `json:"token"`
+	Name  string `json:"name"`
+}
+
+// URL is the webhook's execute URL — what actually sends a message through it (e.g.
+// Alertmanager's discord_configs webhook_url).
+func (w *Webhook) URL() string {
+	return fmt.Sprintf("%s/webhooks/%s/%s", apiBase, w.ID, w.Token)
+}
+
+// FindChannelWebhookByName lists a channel's webhooks and returns the one with the given
+// name, or nil if none matches.
+func (c *Client) FindChannelWebhookByName(ctx context.Context, channelID, name string) (*Webhook, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/channels/"+channelID+"/webhooks", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var webhooks []Webhook
+	if err := c.do(req, &webhooks); err != nil {
+		return nil, err
+	}
+
+	for i := range webhooks {
+		if webhooks[i].Name == name {
+			return &webhooks[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// CreateChannelWebhook creates a new webhook on a channel.
+func (c *Client) CreateChannelWebhook(ctx context.Context, channelID, name string) (*Webhook, error) {
+	body, err := json.Marshal(map[string]any{"name": name})
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := c.newRequest(ctx, http.MethodPost, "/channels/"+channelID+"/webhooks", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	var wh Webhook
+	if err := c.do(req, &wh); err != nil {
+		return nil, err
+	}
+	return &wh, nil
+}
+
+// DeleteWebhook deletes a webhook by ID. A 404 (already gone) is not treated as an error.
+func (c *Client) DeleteWebhook(ctx context.Context, id string) error {
+	req, err := c.newRequest(ctx, http.MethodDelete, "/webhooks/"+id, nil)
+	if err != nil {
+		return err
+	}
+
+	err = c.do(req, nil)
+	if isNotFound(err) {
+		return nil
+	}
+	return err
+}
+
 func isNotFound(err error) bool {
 	statusErr, ok := err.(*StatusError)
 	return ok && statusErr.StatusCode == http.StatusNotFound
