@@ -141,8 +141,8 @@ func eventually(t *testing.T, timeout time.Duration, check func() bool) {
 }
 
 // fakeDiscordTransport is a stateful stand-in for the real Discord API: it actually tracks
-// created channels (by ID), so a channel this fake created stays "found" on later GETs, the
-// same as the real API would. This matters for correctness, not just realism — an
+// created channels and webhooks (by ID), so anything this fake created stays "found" on later
+// GETs, the same as the real API would. This matters for correctness, not just realism — an
 // always-404-on-GET fake (an earlier version of this file) makes the DiscordChannel
 // reconciler's "is the channel I already created still there?" check always say no, so it
 // recreates the channel on every single reconcile instead of just once. Real Kubernetes and
@@ -151,13 +151,20 @@ func eventually(t *testing.T, timeout time.Duration, check func() bool) {
 // was checking creation *count* — a reminder that a too-simple fake can make a real
 // idempotency bug invisible.
 type fakeDiscordTransport struct {
-	nextID   int
-	channels map[string]string // id -> name
-	creates  []string          // name of every channel ever created, in order — for counting
+	nextID          int
+	channels        map[string]string // id -> name
+	creates         []string          // name of every channel ever created, in order — for counting
+	webhooks        map[string]string // id -> name
+	webhookChannels map[string]string // webhook id -> owning channel id
+	webhookCreates  []string          // name of every webhook ever created, in order — for counting
 }
 
 func newFakeDiscordTransport() *fakeDiscordTransport {
-	return &fakeDiscordTransport{channels: map[string]string{}}
+	return &fakeDiscordTransport{
+		channels:        map[string]string{},
+		webhooks:        map[string]string{},
+		webhookChannels: map[string]string{},
+	}
 }
 
 // createCount returns how many times a channel with this exact name was created.
@@ -171,8 +178,62 @@ func (f *fakeDiscordTransport) createCount(name string) int {
 	return n
 }
 
+// webhookCreateCount returns how many times a webhook with this exact name was created.
+func (f *fakeDiscordTransport) webhookCreateCount(name string) int {
+	n := 0
+	for _, c := range f.webhookCreates {
+		if c == name {
+			n++
+		}
+	}
+	return n
+}
+
 func (f *fakeDiscordTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	switch {
+	case req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/api/v10/channels/") && strings.HasSuffix(req.URL.Path, "/webhooks"):
+		channelID := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/api/v10/channels/"), "/webhooks")
+		var b strings.Builder
+		b.WriteByte('[')
+		first := true
+		for id, name := range f.webhooks {
+			if f.webhookChannels[id] != channelID {
+				continue
+			}
+			if !first {
+				b.WriteByte(',')
+			}
+			first = false
+			b.WriteString(`{"id":"` + id + `","token":"tok-` + id + `","name":"` + name + `"}`)
+		}
+		b.WriteByte(']')
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(b.String()))}, nil
+
+	case req.Method == http.MethodPost && strings.HasPrefix(req.URL.Path, "/api/v10/channels/") && strings.HasSuffix(req.URL.Path, "/webhooks"):
+		channelID := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/api/v10/channels/"), "/webhooks")
+		var reqBody struct {
+			Name string `json:"name"`
+		}
+		raw, _ := io.ReadAll(req.Body)
+		_ = json.Unmarshal(raw, &reqBody)
+
+		f.nextID++
+		id := strconv.Itoa(f.nextID)
+		f.webhooks[id] = reqBody.Name
+		f.webhookChannels[id] = channelID
+		f.webhookCreates = append(f.webhookCreates, reqBody.Name)
+		body := `{"id":"` + id + `","token":"tok-` + id + `","name":"` + reqBody.Name + `"}`
+		return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(body))}, nil
+
+	case req.Method == http.MethodDelete && strings.HasPrefix(req.URL.Path, "/api/v10/webhooks/"):
+		id := strings.TrimPrefix(req.URL.Path, "/api/v10/webhooks/")
+		if _, ok := f.webhooks[id]; !ok {
+			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(`{"message":"Unknown Webhook"}`))}, nil
+		}
+		delete(f.webhooks, id)
+		delete(f.webhookChannels, id)
+		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
+
 	case req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/api/v10/channels/"):
 		id := strings.TrimPrefix(req.URL.Path, "/api/v10/channels/")
 		name, ok := f.channels[id]
