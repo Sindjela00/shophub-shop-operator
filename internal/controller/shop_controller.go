@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 
@@ -52,6 +54,7 @@ type ShopReconciler struct {
 // +kubebuilder:rbac:groups=apps.shophub.io,resources=shops/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=postgresql.cnpg.io,resources=clusters,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=redis.redis.opstreelabs.in,resources=redis,verbs=get;list;watch;create;update;patch
 
@@ -61,6 +64,14 @@ func (r *ShopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	var shop shopv1.Shop
 	if err := r.Get(ctx, req.NamespacedName, &shop); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Ahead of the Deployment, though the Deployment would still come up fine either way
+	// (it only ever references the Secret by name, same as the CNPG-generated one below) —
+	// generating it first just means a first-reconcile shop doesn't spend a cycle with the
+	// admin API 500ing on a Secret that was seconds away from existing anyway.
+	if err := r.reconcileAdminKeySecret(ctx, &shop); err != nil {
+		return r.markFailed(ctx, &shop, fmt.Errorf("admin key secret: %w", err))
 	}
 
 	deployment, err := r.reconcileDeployment(ctx, &shop)
@@ -140,6 +151,42 @@ func (r *ShopReconciler) reconcileService(ctx context.Context, shop *shopv1.Shop
 		return controllerutil.SetControllerReference(shop, svc, r.Scheme)
 	})
 	return err
+}
+
+// reconcileAdminKeySecret provisions the static key shophub-shop's AdminApiKeyFilter checks
+// for catalog-management requests (see envFor's Admin__ApiKey wiring). Generated once and
+// left alone afterward — regenerating it on every reconcile would invalidate whatever the
+// owner already has copied into shophub-shop's admin login (see shophub-app's
+// GET /api/shop-sites/{id}/admin-key, which reads this same Secret back for them).
+func (r *ShopReconciler) reconcileAdminKeySecret(ctx context.Context, shop *shopv1.Shop) error {
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: adminKeySecretName(shop.Name), Namespace: shop.Namespace}}
+
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
+		if len(secret.Data["apiKey"]) == 0 {
+			key, err := generateAdminKey()
+			if err != nil {
+				return err
+			}
+			if secret.Data == nil {
+				secret.Data = map[string][]byte{}
+			}
+			secret.Data["apiKey"] = []byte(key)
+		}
+		return controllerutil.SetControllerReference(shop, secret, r.Scheme)
+	})
+	return err
+}
+
+func adminKeySecretName(shopName string) string {
+	return shopName + "-admin-key"
+}
+
+func generateAdminKey() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func (r *ShopReconciler) reconcileDatabase(ctx context.Context, shop *shopv1.Shop) error {
@@ -266,6 +313,15 @@ func envFor(shop *shopv1.Shop) []corev1.EnvVar {
 	env := []corev1.EnvVar{
 		{Name: "SHOP_NAME", Value: shop.Spec.Name},
 		{Name: "Payments__ReceivingWalletAddress", Value: shop.Spec.WalletAddress},
+		{
+			Name: "Admin__ApiKey",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: adminKeySecretName(shop.Name)},
+					Key:                  "apiKey",
+				},
+			},
+		},
 	}
 	if shop.Spec.DatabaseKind == shopv1.ShopDatabaseKindLight {
 		return env
