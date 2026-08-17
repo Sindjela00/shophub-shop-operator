@@ -231,3 +231,73 @@ func TestShopReconciler_setsOwnerReferencesForGarbageCollection(t *testing.T) {
 		t.Errorf("deployment owner references = %+v, want a single Shop/shop-1 owner", owners)
 	}
 }
+
+func TestShopReconciler_provisionsAnAdminKeySecretWiredIntoTheDeployment(t *testing.T) {
+	fakeClient, _ := reconcileShop(t, newShop(shopv1.ShopAvailabilityStandard, shopv1.ShopDatabaseKindStandard))
+
+	var secret corev1.Secret
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1-admin-key", Namespace: "shops"}, &secret); err != nil {
+		t.Fatalf("Get admin key secret returned error: %v", err)
+	}
+	key := secret.Data["apiKey"]
+	if len(key) == 0 {
+		t.Fatal("admin key secret has no apiKey data")
+	}
+
+	owners := secret.GetOwnerReferences()
+	if len(owners) != 1 || owners[0].Name != "shop-1" || owners[0].Kind != "Shop" {
+		t.Errorf("secret owner references = %+v, want a single Shop/shop-1 owner", owners)
+	}
+
+	var deployment appsv1.Deployment
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1", Namespace: "shops"}, &deployment); err != nil {
+		t.Fatalf("Get deployment returned error: %v", err)
+	}
+	var found *corev1.EnvVar
+	for _, e := range deployment.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "Admin__ApiKey" {
+			found = &e
+			break
+		}
+	}
+	if found == nil || found.ValueFrom == nil || found.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("Admin__ApiKey not sourced from a secretKeyRef: %+v", found)
+	}
+	if found.ValueFrom.SecretKeyRef.Name != "shop-1-admin-key" || found.ValueFrom.SecretKeyRef.Key != "apiKey" {
+		t.Errorf("Admin__ApiKey secretKeyRef = %+v, want name=shop-1-admin-key key=apiKey", found.ValueFrom.SecretKeyRef)
+	}
+}
+
+func TestShopReconciler_doesNotRegenerateTheAdminKeyOnRepeatedReconciles(t *testing.T) {
+	scheme := newShopTestScheme(t)
+	shop := newShop(shopv1.ShopAvailabilityStandard, shopv1.ShopDatabaseKindStandard)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(shop).
+		WithStatusSubresource(&shopv1.Shop{}).
+		Build()
+	r := &ShopReconciler{Client: fakeClient, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: shop.Name, Namespace: shop.Namespace}}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("first Reconcile returned error: %v", err)
+	}
+	var firstSecret corev1.Secret
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1-admin-key", Namespace: "shops"}, &firstSecret); err != nil {
+		t.Fatalf("Get admin key secret returned error: %v", err)
+	}
+	firstKey := string(firstSecret.Data["apiKey"])
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("second Reconcile returned error: %v", err)
+	}
+	var secondSecret corev1.Secret
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1-admin-key", Namespace: "shops"}, &secondSecret); err != nil {
+		t.Fatalf("Get admin key secret returned error: %v", err)
+	}
+	secondKey := string(secondSecret.Data["apiKey"])
+
+	if firstKey != secondKey {
+		t.Errorf("admin key changed across reconciles: %q -> %q, want it to stay stable", firstKey, secondKey)
+	}
+}
