@@ -100,6 +100,11 @@ func TestShopReconciler_createsServiceRoutingToTheDeployment(t *testing.T) {
 	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 80 {
 		t.Errorf("service ports = %+v, want a single port 80", svc.Spec.Ports)
 	}
+	// Not just spec.selector — shophub-kube-state's ServiceMonitor discovers shops by a label
+	// on the Service object itself, not by anything pod-selector-shaped.
+	if svc.Labels["app.kubernetes.io/name"] != "shophub-shop" || svc.Labels["app.kubernetes.io/instance"] != "shop-1" {
+		t.Errorf("service labels = %v, want app.kubernetes.io/name=shophub-shop and app.kubernetes.io/instance=shop-1", svc.Labels)
+	}
 }
 
 func TestShopReconciler_standardDatabaseKindCreatesCNPGCluster(t *testing.T) {

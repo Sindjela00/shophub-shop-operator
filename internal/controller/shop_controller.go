@@ -144,6 +144,13 @@ func (r *ShopReconciler) reconcileService(ctx context.Context, shop *shopv1.Shop
 	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: shop.Name, Namespace: shop.Namespace}}
 
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		// Also on the Service object itself, not just spec.selector (which only controls
+		// which pods it routes to) — shophub-kube-state's ServiceMonitor selects Services by
+		// this same label, and without it Prometheus never discovers a shop's /metrics at
+		// all. Confirmed for real: every shop's Service had zero labels, so the per-shop
+		// dashboard and alert rules had nothing to scrape, silently, since that feature was
+		// built.
+		svc.ObjectMeta.Labels = labels
 		svc.Spec.Selector = labels
 		svc.Spec.Ports = []corev1.ServicePort{
 			{Name: "http", Port: 80, TargetPort: intstr.FromInt32(shopContainerPort)},
