@@ -115,10 +115,7 @@ func (r *ShopReconciler) reconcileDeployment(ctx context.Context, shop *shopv1.S
 						Name:  "shop",
 						Image: shopImage(),
 						Ports: []corev1.ContainerPort{{ContainerPort: shopContainerPort}},
-						Env: []corev1.EnvVar{
-							{Name: "SHOP_NAME", Value: shop.Spec.Name},
-							{Name: "SHOP_WALLET_ADDRESS", Value: shop.Spec.WalletAddress},
-						},
+						Env:   envFor(shop),
 					},
 				},
 			},
@@ -249,4 +246,54 @@ func redisImage() string {
 		return img
 	}
 	return defaultRedisImage
+}
+
+// envFor builds the shop container's environment, including its database connection string.
+// For the "standard" (CNPG) tier this composes ConnectionStrings__Default (the shophub-shop
+// backend's Npgsql config key) from the individual keys in CNPG's generated `<cluster>-app`
+// Secret, using Kubernetes' own $(VAR) env-var interpolation rather than an init container —
+// CNPG's own "uri" key isn't in Npgsql's connection-string format, and there's no single
+// secret key already in that format to reference directly.
+//
+// The "light" (Redis) tier deliberately doesn't get a ConnectionStrings__Default: shophub-shop's
+// EF Core DbContext is Npgsql-only today, so there's no Redis-backed connection string this
+// controller could wire up that the app would actually use.
+//
+// Payments__ReceivingWalletAddress is the config key shophub-shop's PaymentOptions actually
+// binds (see that repo's PaymentOptions.ReceivingWalletAddress doc comment — it was written
+// expecting exactly this wiring). SHOP_WALLET_ADDRESS is kept alongside it for any other
+// consumer that might read the plain env var, but it isn't itself read by shophub-shop today.
+func envFor(shop *shopv1.Shop) []corev1.EnvVar {
+	env := []corev1.EnvVar{
+		{Name: "SHOP_NAME", Value: shop.Spec.Name},
+		{Name: "SHOP_WALLET_ADDRESS", Value: shop.Spec.WalletAddress},
+		{Name: "Payments__ReceivingWalletAddress", Value: shop.Spec.WalletAddress},
+	}
+	if shop.Spec.DatabaseKind == shopv1.ShopDatabaseKindLight {
+		return env
+	}
+
+	appSecret := dbName(shop.Name) + "-app"
+	secretEnvVar := func(name, key string) corev1.EnvVar {
+		return corev1.EnvVar{
+			Name: name,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: appSecret},
+					Key:                  key,
+				},
+			},
+		}
+	}
+	return append(env,
+		secretEnvVar("DB_HOST", "host"),
+		secretEnvVar("DB_PORT", "port"),
+		secretEnvVar("DB_NAME", "dbname"),
+		secretEnvVar("DB_USER", "username"),
+		secretEnvVar("DB_PASSWORD", "password"),
+		corev1.EnvVar{
+			Name:  "ConnectionStrings__Default",
+			Value: "Host=$(DB_HOST);Port=$(DB_PORT);Database=$(DB_NAME);Username=$(DB_USER);Password=$(DB_PASSWORD)",
+		},
+	)
 }
