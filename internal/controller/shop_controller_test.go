@@ -120,6 +120,84 @@ func TestShopReconciler_standardDatabaseKindCreatesCNPGCluster(t *testing.T) {
 	}
 }
 
+func TestShopReconciler_wiresReceivingWalletAddressForPayments(t *testing.T) {
+	fakeClient, _ := reconcileShop(t, newShop(shopv1.ShopAvailabilityStandard, shopv1.ShopDatabaseKindStandard))
+
+	var deployment appsv1.Deployment
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1", Namespace: "shops"}, &deployment); err != nil {
+		t.Fatalf("Get deployment returned error: %v", err)
+	}
+
+	var found *corev1.EnvVar
+	for _, e := range deployment.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "Payments__ReceivingWalletAddress" {
+			found = &e
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("Payments__ReceivingWalletAddress env var not set")
+	}
+	if found.Value != testWalletAddress {
+		t.Errorf("Payments__ReceivingWalletAddress = %q, want %q", found.Value, testWalletAddress)
+	}
+}
+
+func TestShopReconciler_standardDatabaseKindWiresConnectionStringFromCNPGSecret(t *testing.T) {
+	fakeClient, _ := reconcileShop(t, newShop(shopv1.ShopAvailabilityStandard, shopv1.ShopDatabaseKindStandard))
+
+	var deployment appsv1.Deployment
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1", Namespace: "shops"}, &deployment); err != nil {
+		t.Fatalf("Get deployment returned error: %v", err)
+	}
+
+	env := deployment.Spec.Template.Spec.Containers[0].Env
+	byName := map[string]corev1.EnvVar{}
+	for _, e := range env {
+		byName[e.Name] = e
+	}
+
+	conn, ok := byName["ConnectionStrings__Default"]
+	if !ok {
+		t.Fatal("ConnectionStrings__Default env var not set")
+	}
+	wantValue := "Host=$(DB_HOST);Port=$(DB_PORT);Database=$(DB_NAME);Username=$(DB_USER);Password=$(DB_PASSWORD)"
+	if conn.Value != wantValue {
+		t.Errorf("ConnectionStrings__Default = %q, want %q", conn.Value, wantValue)
+	}
+
+	for _, want := range []struct{ name, key string }{
+		{"DB_HOST", "host"}, {"DB_PORT", "port"}, {"DB_NAME", "dbname"},
+		{"DB_USER", "username"}, {"DB_PASSWORD", "password"},
+	} {
+		e, ok := byName[want.name]
+		if !ok || e.ValueFrom == nil || e.ValueFrom.SecretKeyRef == nil {
+			t.Fatalf("%s not sourced from a secretKeyRef: %+v", want.name, e)
+		}
+		if e.ValueFrom.SecretKeyRef.Name != "shop-1-db-app" {
+			t.Errorf("%s secret name = %q, want %q", want.name, e.ValueFrom.SecretKeyRef.Name, "shop-1-db-app")
+		}
+		if e.ValueFrom.SecretKeyRef.Key != want.key {
+			t.Errorf("%s secret key = %q, want %q", want.name, e.ValueFrom.SecretKeyRef.Key, want.key)
+		}
+	}
+}
+
+func TestShopReconciler_lightDatabaseKindDoesNotSetConnectionString(t *testing.T) {
+	fakeClient, _ := reconcileShop(t, newShop(shopv1.ShopAvailabilityStandard, shopv1.ShopDatabaseKindLight))
+
+	var deployment appsv1.Deployment
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1", Namespace: "shops"}, &deployment); err != nil {
+		t.Fatalf("Get deployment returned error: %v", err)
+	}
+
+	for _, e := range deployment.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "ConnectionStrings__Default" {
+			t.Errorf("ConnectionStrings__Default should not be set for the light/Redis tier, got %+v", e)
+		}
+	}
+}
+
 func TestShopReconciler_lightDatabaseKindCreatesRedisNotCNPG(t *testing.T) {
 	fakeClient, _ := reconcileShop(t, newShop(shopv1.ShopAvailabilityStandard, shopv1.ShopDatabaseKindLight))
 
