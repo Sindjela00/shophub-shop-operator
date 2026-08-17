@@ -261,12 +261,10 @@ func redisImage() string {
 //
 // Payments__ReceivingWalletAddress is the config key shophub-shop's PaymentOptions actually
 // binds (see that repo's PaymentOptions.ReceivingWalletAddress doc comment — it was written
-// expecting exactly this wiring). SHOP_WALLET_ADDRESS is kept alongside it for any other
-// consumer that might read the plain env var, but it isn't itself read by shophub-shop today.
+// expecting exactly this wiring).
 func envFor(shop *shopv1.Shop) []corev1.EnvVar {
 	env := []corev1.EnvVar{
 		{Name: "SHOP_NAME", Value: shop.Spec.Name},
-		{Name: "SHOP_WALLET_ADDRESS", Value: shop.Spec.WalletAddress},
 		{Name: "Payments__ReceivingWalletAddress", Value: shop.Spec.WalletAddress},
 	}
 	if shop.Spec.DatabaseKind == shopv1.ShopDatabaseKindLight {
