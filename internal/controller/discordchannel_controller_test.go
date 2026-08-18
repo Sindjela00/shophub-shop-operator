@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -61,7 +62,7 @@ func (f *recordingDiscordTransport) RoundTrip(req *http.Request) (*http.Response
 	f.Requests = append(f.Requests, req.Method+" "+req.URL.Path)
 
 	switch {
-	case req.Method == http.MethodGet && req.URL.Path == "/api/v10/guilds/test-guild/channels":
+	case req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/api/v10/guilds/") && strings.HasSuffix(req.URL.Path, "/channels"):
 		list := make([]discord.Channel, 0, len(f.channels))
 		for _, ch := range f.channels {
 			list = append(list, ch)
@@ -104,7 +105,7 @@ func (f *recordingDiscordTransport) RoundTrip(req *http.Request) (*http.Response
 		}
 		return jsonResp(http.StatusNotFound, map[string]string{"message": "Unknown Channel"}), nil
 
-	case req.Method == http.MethodPost && req.URL.Path == "/api/v10/guilds/test-guild/channels":
+	case req.Method == http.MethodPost && strings.HasPrefix(req.URL.Path, "/api/v10/guilds/") && strings.HasSuffix(req.URL.Path, "/channels"):
 		var body struct {
 			Name string `json:"name"`
 		}
@@ -112,6 +113,13 @@ func (f *recordingDiscordTransport) RoundTrip(req *http.Request) (*http.Response
 		_ = json.Unmarshal(raw, &body)
 		ch := f.seedChannel(body.Name)
 		return jsonResp(http.StatusCreated, ch), nil
+
+	case req.Method == http.MethodPost && strings.HasPrefix(req.URL.Path, "/api/v10/channels/") && strings.HasSuffix(req.URL.Path, "/messages"):
+		channelID := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/api/v10/channels/"), "/messages")
+		if _, ok := f.channels[channelID]; !ok {
+			return jsonResp(http.StatusNotFound, map[string]string{"message": "Unknown Channel"}), nil
+		}
+		return jsonResp(http.StatusOK, map[string]string{"id": "msg-1"}), nil
 
 	case req.Method == http.MethodDelete && strings.HasPrefix(req.URL.Path, "/api/v10/channels/"):
 		id := strings.TrimPrefix(req.URL.Path, "/api/v10/channels/")
@@ -142,10 +150,9 @@ func newDiscordReconciler(t *testing.T, transport *recordingDiscordTransport, dc
 	discordClient := &discord.Client{
 		HTTPClient: &http.Client{Transport: transport},
 		BotToken:   "test-token",
-		GuildID:    "test-guild",
 	}
 
-	r := &DiscordChannelReconciler{Client: fakeClient, Scheme: scheme, Discord: discordClient}
+	r := &DiscordChannelReconciler{Client: fakeClient, Scheme: scheme, DefaultGuildID: "test-guild", Discord: discordClient}
 	return r, fakeClient
 }
 
@@ -187,13 +194,42 @@ func TestDiscordChannelReconciler_createsChannelAndRecordsID(t *testing.T) {
 	}
 
 	createCalls := 0
+	welcomeCalls := 0
 	for _, req := range transport.Requests {
 		if req == "POST /api/v10/guilds/test-guild/channels" {
 			createCalls++
 		}
+		if req == "POST /api/v10/channels/"+got.Status.ChannelID+"/messages" {
+			welcomeCalls++
+		}
 	}
 	if createCalls != 1 {
 		t.Errorf("CreateChannel called %d times, want 1", createCalls)
+	}
+	if welcomeCalls != 1 {
+		t.Errorf("welcome message sent %d times on real channel creation, want 1: %v", welcomeCalls, transport.Requests)
+	}
+}
+
+func TestDiscordChannelReconciler_usesTheGuildIDFromSpecOverTheDefault(t *testing.T) {
+	transport := newRecordingDiscordTransport()
+	dc := newDiscordChannel()
+	dc.Spec.GuildID = "owner-guild"
+	r, _ := newDiscordReconciler(t, transport, dc)
+
+	reconcileDiscordChannel(t, r, "shop-1")
+
+	found := false
+	for _, req := range transport.Requests {
+		if req == "POST /api/v10/guilds/owner-guild/channels" {
+			found = true
+		}
+		if req == "POST /api/v10/guilds/test-guild/channels" {
+			t.Errorf("expected the CR's own GuildID (owner-guild) to be used instead of the default (test-guild), but got: %v", transport.Requests)
+		}
+	}
+	if !found {
+		t.Errorf("expected a channel-create call against the CR's own guild (owner-guild), got: %v", transport.Requests)
 	}
 }
 
@@ -234,6 +270,9 @@ func TestDiscordChannelReconciler_findsExistingChannelByNameInsteadOfDuplicating
 	for _, req := range transport.Requests {
 		if req == "POST /api/v10/guilds/test-guild/channels" {
 			t.Errorf("expected no channel creation when one with the same name already exists, but got: %v", transport.Requests)
+		}
+		if req == "POST /api/v10/channels/1/messages" {
+			t.Errorf("expected no welcome message when the channel already existed (found, not created), but got: %v", transport.Requests)
 		}
 	}
 }
@@ -325,5 +364,57 @@ func TestDiscordChannelReconciler_isIdempotentForWebhookCreationAcrossReconciles
 	}
 	if webhookCreates != 1 {
 		t.Errorf("webhook created %d times across repeated reconciles, want 1: %v", webhookCreates, transport.Requests)
+	}
+}
+
+func TestDiscordChannelReconciler_generatesAlertmanagerConfigRoutingToTheWebhookSecret(t *testing.T) {
+	transport := newRecordingDiscordTransport()
+	dc := newDiscordChannel()
+	r, fakeClient := newDiscordReconciler(t, transport, dc)
+
+	reconcileDiscordChannel(t, r, "shop-1")
+
+	var got shopv1.DiscordChannel
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1", Namespace: "shops"}, &got); err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+
+	amConfig := &unstructured.Unstructured{}
+	amConfig.SetGroupVersionKind(alertmanagerConfigGVK)
+	key := types.NamespacedName{Name: "shop-1-discord-routing", Namespace: "shops"}
+	if err := fakeClient.Get(context.Background(), key, amConfig); err != nil {
+		t.Fatalf("expected AlertmanagerConfig %s to exist, got error: %v", key, err)
+	}
+
+	receiver, _, _ := unstructured.NestedString(amConfig.Object, "spec", "route", "receiver")
+	if receiver != "shop-1-discord" {
+		t.Errorf("route.receiver = %q, want %q", receiver, "shop-1-discord")
+	}
+
+	matchers, _, _ := unstructured.NestedSlice(amConfig.Object, "spec", "route", "matchers")
+	if len(matchers) != 1 {
+		t.Fatalf("route.matchers = %+v, want exactly one matcher", matchers)
+	}
+	matcher, _ := matchers[0].(map[string]any)
+	if matcher["value"] != "shop-1" || matcher["name"] != "service" || matcher["matchType"] != "=" {
+		t.Errorf("route.matchers[0] = %+v, want {name:service value:shop-1 matchType:=}", matcher)
+	}
+
+	receivers, _, _ := unstructured.NestedSlice(amConfig.Object, "spec", "receivers")
+	if len(receivers) != 1 {
+		t.Fatalf("spec.receivers = %+v, want exactly one receiver", receivers)
+	}
+	receiverObj, _ := receivers[0].(map[string]any)
+	discordConfigs, _ := receiverObj["discordConfigs"].([]any)
+	if len(discordConfigs) != 1 {
+		t.Fatalf("receivers[0].discordConfigs = %+v, want exactly one", discordConfigs)
+	}
+	apiURL, _ := discordConfigs[0].(map[string]any)["apiURL"].(map[string]any)
+	if apiURL["name"] != got.Status.WebhookSecretRef || apiURL["key"] != "webhookUrl" {
+		t.Errorf("receivers[0].discordConfigs[0].apiURL = %+v, want {name:%q key:webhookUrl}", apiURL, got.Status.WebhookSecretRef)
+	}
+
+	if len(amConfig.GetOwnerReferences()) != 1 || amConfig.GetOwnerReferences()[0].Name != got.Name {
+		t.Errorf("AlertmanagerConfig owner references = %+v, want a single owner reference to %q", amConfig.GetOwnerReferences(), got.Name)
 	}
 }

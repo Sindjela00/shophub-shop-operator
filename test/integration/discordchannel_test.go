@@ -8,10 +8,14 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	shopv1 "github.com/shophub/shophub-shop-operator/api/v1"
 )
+
+var alertmanagerConfigGVK = schema.GroupVersionKind{Group: "monitoring.coreos.com", Version: "v1alpha1", Kind: "AlertmanagerConfig"}
 
 func TestDiscordChannelReconciliation_provisionsAChannel(t *testing.T) {
 	ctx := context.Background()
@@ -144,6 +148,50 @@ func TestDiscordChannelReconciliation_deletesTheWebhookWhenTheCRIsDeleted(t *tes
 
 	if _, exists := discordTestData.webhooks[webhookID]; exists {
 		t.Errorf("webhook %q still exists in the fake Discord backend after CR deletion", webhookID)
+	}
+}
+
+func TestDiscordChannelReconciliation_generatesAlertmanagerConfig(t *testing.T) {
+	ctx := context.Background()
+	dc := &shopv1.DiscordChannel{
+		ObjectMeta: metav1.ObjectMeta{Name: "dc-it-amconfig", Namespace: "default"},
+		Spec:       shopv1.DiscordChannelSpec{ShopRef: "dc-it-amconfig", ChannelName: "AM Config Channel"},
+	}
+	if err := k8sClient.Create(ctx, dc); err != nil {
+		t.Fatalf("create discordchannel: %v", err)
+	}
+
+	var got shopv1.DiscordChannel
+	eventually(t, 5*time.Second, func() bool {
+		if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(dc), &got); err != nil {
+			return false
+		}
+		return got.Status.WebhookSecretRef != ""
+	})
+
+	amConfig := &unstructured.Unstructured{}
+	amConfig.SetGroupVersionKind(alertmanagerConfigGVK)
+	key := client.ObjectKey{Name: dc.Name + "-discord-routing", Namespace: "default"}
+	if err := k8sClient.Get(ctx, key, amConfig); err != nil {
+		t.Fatalf("expected AlertmanagerConfig %s to exist: %v", key, err)
+	}
+
+	receivers, _, _ := unstructured.NestedSlice(amConfig.Object, "spec", "receivers")
+	if len(receivers) != 1 {
+		t.Fatalf("spec.receivers = %+v, want exactly one receiver", receivers)
+	}
+	receiverObj, _ := receivers[0].(map[string]any)
+	discordConfigs, _ := receiverObj["discordConfigs"].([]any)
+	if len(discordConfigs) != 1 {
+		t.Fatalf("receivers[0].discordConfigs = %+v, want exactly one", discordConfigs)
+	}
+	apiURL, _ := discordConfigs[0].(map[string]any)["apiURL"].(map[string]any)
+	if apiURL["name"] != got.Status.WebhookSecretRef {
+		t.Errorf("spec.receivers[0].discordConfigs[0].apiURL.name = %v, want %q", apiURL["name"], got.Status.WebhookSecretRef)
+	}
+
+	if len(amConfig.GetOwnerReferences()) != 1 || amConfig.GetOwnerReferences()[0].Name != dc.Name {
+		t.Errorf("AlertmanagerConfig owner references = %+v, want a single owner reference to %q", amConfig.GetOwnerReferences(), dc.Name)
 	}
 }
 

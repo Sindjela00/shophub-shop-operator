@@ -28,16 +28,17 @@ type Channel struct {
 	Type int    `json:"type"`
 }
 
-// Client talks to the Discord REST API on behalf of a single bot/guild.
+// Client talks to the Discord REST API on behalf of a single bot, across whichever guilds it's
+// been invited into — the bot serves many shops' own servers plus the operator's default guild,
+// so the guild is a per-call argument rather than fixed on the Client.
 type Client struct {
 	HTTPClient *http.Client
 	BotToken   string
-	GuildID    string
 }
 
 // NewClient builds a Client using http.DefaultClient as its transport.
-func NewClient(botToken, guildID string) *Client {
-	return &Client{BotToken: botToken, GuildID: guildID}
+func NewClient(botToken string) *Client {
+	return &Client{BotToken: botToken}
 }
 
 var invalidChars = regexp.MustCompile(`[^a-z0-9_-]+`)
@@ -59,10 +60,10 @@ func SanitizeChannelName(name string) string {
 	return s
 }
 
-// FindChannelByName lists the configured guild's channels and returns the one with the given
-// name, or nil if none matches.
-func (c *Client) FindChannelByName(ctx context.Context, name string) (*Channel, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("/guilds/%s/channels", c.GuildID), nil)
+// FindChannelByName lists the given guild's channels and returns the one with the given name,
+// or nil if none matches.
+func (c *Client) FindChannelByName(ctx context.Context, guildID, name string) (*Channel, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("/guilds/%s/channels", guildID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -98,14 +99,14 @@ func (c *Client) GetChannel(ctx context.Context, id string) (*Channel, error) {
 	return &ch, nil
 }
 
-// CreateChannel creates a new text channel in the configured guild.
-func (c *Client) CreateChannel(ctx context.Context, name string) (*Channel, error) {
+// CreateChannel creates a new text channel in the given guild.
+func (c *Client) CreateChannel(ctx context.Context, guildID, name string) (*Channel, error) {
 	body, err := json.Marshal(map[string]any{"name": name, "type": GuildTextChannelType})
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := c.newRequest(ctx, http.MethodPost, fmt.Sprintf("/guilds/%s/channels", c.GuildID), bytes.NewReader(body))
+	req, err := c.newRequest(ctx, http.MethodPost, fmt.Sprintf("/guilds/%s/channels", guildID), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -199,6 +200,22 @@ func (c *Client) DeleteWebhook(ctx context.Context, id string) error {
 		return nil
 	}
 	return err
+}
+
+// SendMessage posts a plain-text message to a channel — used for the one-time welcome message
+// after a channel is first created.
+func (c *Client) SendMessage(ctx context.Context, channelID, content string) error {
+	body, err := json.Marshal(map[string]any{"content": content})
+	if err != nil {
+		return err
+	}
+
+	req, err := c.newRequest(ctx, http.MethodPost, "/channels/"+channelID+"/messages", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+
+	return c.do(req, nil)
 }
 
 func isNotFound(err error) bool {

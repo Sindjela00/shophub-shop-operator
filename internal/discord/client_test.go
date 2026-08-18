@@ -29,7 +29,6 @@ func newTestClient(respond func(req *http.Request) (*http.Response, error)) *Cli
 	return &Client{
 		HTTPClient: &http.Client{Transport: &fakeTransport{respond: respond}},
 		BotToken:   "test-token",
-		GuildID:    "test-guild",
 	}
 }
 
@@ -60,7 +59,7 @@ func TestCreateChannel_sendsCorrectRequestAndParsesResponse(t *testing.T) {
 		return jsonResponse(http.StatusCreated, `{"id":"12345","name":"aurora-shop","type":0}`), nil
 	})
 
-	ch, err := client.CreateChannel(context.Background(), "aurora-shop")
+	ch, err := client.CreateChannel(context.Background(), "test-guild", "aurora-shop")
 	if err != nil {
 		t.Fatalf("CreateChannel returned error: %v", err)
 	}
@@ -95,7 +94,7 @@ func TestCreateChannel_returnsStatusErrorOnFailure(t *testing.T) {
 		return jsonResponse(http.StatusForbidden, `{"message":"Missing Permissions","code":50013}`), nil
 	})
 
-	_, err := client.CreateChannel(context.Background(), "aurora-shop")
+	_, err := client.CreateChannel(context.Background(), "test-guild", "aurora-shop")
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -116,7 +115,7 @@ func TestFindChannelByName_findsMatchingChannel(t *testing.T) {
 		return jsonResponse(http.StatusOK, `[{"id":"1","name":"other-shop","type":0},{"id":"2","name":"aurora-shop","type":0}]`), nil
 	})
 
-	ch, err := client.FindChannelByName(context.Background(), "aurora-shop")
+	ch, err := client.FindChannelByName(context.Background(), "test-guild", "aurora-shop")
 	if err != nil {
 		t.Fatalf("FindChannelByName returned error: %v", err)
 	}
@@ -130,7 +129,7 @@ func TestFindChannelByName_returnsNilWhenNotFound(t *testing.T) {
 		return jsonResponse(http.StatusOK, `[{"id":"1","name":"other-shop","type":0}]`), nil
 	})
 
-	ch, err := client.FindChannelByName(context.Background(), "aurora-shop")
+	ch, err := client.FindChannelByName(context.Background(), "test-guild", "aurora-shop")
 	if err != nil {
 		t.Fatalf("FindChannelByName returned error: %v", err)
 	}
@@ -282,6 +281,46 @@ func TestDeleteWebhook_propagatesOtherErrors(t *testing.T) {
 	})
 
 	if err := client.DeleteWebhook(context.Background(), "id"); err == nil {
+		t.Error("expected an error, got nil")
+	}
+}
+
+func TestSendMessage_sendsCorrectRequest(t *testing.T) {
+	var capturedReq *http.Request
+	var capturedBody []byte
+
+	client := newTestClient(func(req *http.Request) (*http.Response, error) {
+		capturedReq = req
+		capturedBody, _ = io.ReadAll(req.Body)
+		return jsonResponse(http.StatusOK, `{"id":"msg-1"}`), nil
+	})
+
+	if err := client.SendMessage(context.Background(), "42", "hello there"); err != nil {
+		t.Fatalf("SendMessage returned error: %v", err)
+	}
+
+	if capturedReq.Method != http.MethodPost {
+		t.Errorf("method = %s, want POST", capturedReq.Method)
+	}
+	if capturedReq.URL.String() != "https://discord.com/api/v10/channels/42/messages" {
+		t.Errorf("url = %s, want /channels/42/messages", capturedReq.URL.String())
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(capturedBody, &body); err != nil {
+		t.Fatalf("request body isn't valid JSON: %v", err)
+	}
+	if body["content"] != "hello there" {
+		t.Errorf("request body content = %v, want %q", body["content"], "hello there")
+	}
+}
+
+func TestSendMessage_propagatesErrors(t *testing.T) {
+	client := newTestClient(func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusForbidden, `{"message":"Missing Permissions","code":50013}`), nil
+	})
+
+	if err := client.SendMessage(context.Background(), "42", "hello"); err == nil {
 		t.Error("expected an error, got nil")
 	}
 }

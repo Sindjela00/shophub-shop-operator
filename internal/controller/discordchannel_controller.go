@@ -7,7 +7,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -16,6 +18,12 @@ import (
 	shopv1 "github.com/shophub/shophub-shop-operator/api/v1"
 	"github.com/shophub/shophub-shop-operator/internal/discord"
 )
+
+// alertmanagerConfigGVK is the Prometheus Operator's AlertmanagerConfig type. Referenced as
+// unstructured rather than a typed import — this repo doesn't vendor the prometheus-operator
+// Go module (same reasoning this controller set never vendored CNPG's types either), and the
+// object this reconciler writes has a small, fixed shape that's easy to hand-build.
+var alertmanagerConfigGVK = schema.GroupVersionKind{Group: "monitoring.coreos.com", Version: "v1alpha1", Kind: "AlertmanagerConfig"}
 
 // discordChannelFinalizer ensures the real Discord channel is deleted before the CR that
 // represents it is allowed to go away — unlike the Deployment/Service/database CRs the Shop
@@ -26,13 +34,18 @@ const discordChannelFinalizer = "apps.shophub.io/discordchannel-cleanup"
 // DiscordChannelReconciler reconciles a DiscordChannel object.
 type DiscordChannelReconciler struct {
 	client.Client
-	Scheme  *runtime.Scheme
-	Discord *discord.Client
+	Scheme *runtime.Scheme
+	// DefaultGuildID is used for any DiscordChannel whose own Spec.GuildID is empty — the
+	// operator's own configured guild (DISCORD_GUILD_ID), which is how shophub-app's own
+	// platform alert channel and any not-yet-attached shop's channel are provisioned.
+	DefaultGuildID string
+	Discord        *discord.Client
 }
 
 // +kubebuilder:rbac:groups=apps.shophub.io,resources=discordchannels,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=apps.shophub.io,resources=discordchannels/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=alertmanagerconfigs,verbs=get;list;watch;create;update;patch
 
 func webhookSecretName(dc *shopv1.DiscordChannel) string {
 	return dc.Name + "-discord-webhook"
@@ -59,6 +72,11 @@ func (r *DiscordChannelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	name := discord.SanitizeChannelName(dc.Spec.ChannelName)
 
+	guildID := dc.Spec.GuildID
+	if guildID == "" {
+		guildID = r.DefaultGuildID
+	}
+
 	// Idempotent: if we already recorded a channel ID, confirm it's still there rather than
 	// blindly assuming a new one is needed (e.g. after a manager restart).
 	var channel *discord.Channel
@@ -72,19 +90,33 @@ func (r *DiscordChannelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		// recreate it below.
 	}
 
+	justCreated := false
 	if channel == nil {
 		// Guard against duplicate creation if a previous reconcile created the channel but
 		// failed before persisting status.channelId.
-		found, err := r.Discord.FindChannelByName(ctx, name)
+		found, err := r.Discord.FindChannelByName(ctx, guildID, name)
 		if err != nil {
 			return r.markFailed(ctx, &dc, err)
 		}
 		channel = found
 		if channel == nil {
-			channel, err = r.Discord.CreateChannel(ctx, name)
+			channel, err = r.Discord.CreateChannel(ctx, guildID, name)
 			if err != nil {
 				return r.markFailed(ctx, &dc, err)
 			}
+			justCreated = true
+		}
+	}
+
+	// Best-effort only: a failed welcome message shouldn't fail the whole reconcile (and
+	// requeue-retry it) when the channel/webhook — the parts that actually matter for
+	// alerting — are otherwise fine. Gated on justCreated so it fires exactly once per channel:
+	// a later reconcile that finds this same channel via FindChannelByName above never re-enters
+	// this branch, so there's no need for a separate "already welcomed" status field.
+	if justCreated {
+		welcome := fmt.Sprintf("👋 This channel will receive alert notifications for **%s**.", name)
+		if err := r.Discord.SendMessage(ctx, channel.ID, welcome); err != nil {
+			logger.Error(err, "failed to send welcome message", "channel", name, "channelId", channel.ID)
 		}
 	}
 
@@ -117,6 +149,10 @@ func (r *DiscordChannelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return r.markFailed(ctx, &dc, err)
 	}
 
+	if err := r.reconcileAlertmanagerConfig(ctx, &dc, secret.Name); err != nil {
+		return r.markFailed(ctx, &dc, err)
+	}
+
 	dc.Status.ChannelID = channel.ID
 	dc.Status.WebhookID = webhook.ID
 	dc.Status.WebhookSecretRef = secret.Name
@@ -132,6 +168,43 @@ func (r *DiscordChannelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	logger.Info("provisioned discord channel and webhook", "channel", name, "channelId", channel.ID, "webhookId", webhook.ID)
 	return ctrl.Result{}, nil
+}
+
+// reconcileAlertmanagerConfig creates or updates the AlertmanagerConfig that routes this shop's
+// (or shophub-app's own) alerts to its Discord webhook. Previously this was a manually
+// hand-copied object per shop (see shophub-kube-state's history) — generating it here means
+// alerting actually reaches Discord with zero manual steps for every DiscordChannel that gets a
+// working webhook. Matcher/receiver names follow the same "service=<this CR's name>" convention
+// the manual version used, so it lines up with however the PrometheusRule alerts are labeled.
+func (r *DiscordChannelReconciler) reconcileAlertmanagerConfig(ctx context.Context, dc *shopv1.DiscordChannel, webhookSecretName string) error {
+	amConfig := &unstructured.Unstructured{}
+	amConfig.SetGroupVersionKind(alertmanagerConfigGVK)
+	amConfig.SetName(dc.Name + "-discord-routing")
+	amConfig.SetNamespace(dc.Namespace)
+
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, amConfig, func() error {
+		receiverName := dc.Name + "-discord"
+		amConfig.Object["spec"] = map[string]any{
+			"route": map[string]any{
+				"receiver": receiverName,
+				"matchers": []any{
+					map[string]any{"name": "service", "value": dc.Name, "matchType": "="},
+				},
+			},
+			"receivers": []any{
+				map[string]any{
+					"name": receiverName,
+					"discordConfigs": []any{
+						map[string]any{
+							"apiURL": map[string]any{"name": webhookSecretName, "key": "webhookUrl"},
+						},
+					},
+				},
+			},
+		}
+		return controllerutil.SetControllerReference(dc, amConfig, r.Scheme)
+	})
+	return err
 }
 
 func (r *DiscordChannelReconciler) reconcileDelete(ctx context.Context, dc *shopv1.DiscordChannel) (ctrl.Result, error) {

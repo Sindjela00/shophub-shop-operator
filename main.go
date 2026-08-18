@@ -55,7 +55,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	discordClient := discord.NewClient(os.Getenv("DISCORD_BOT_TOKEN"), os.Getenv("DISCORD_GUILD_ID"))
+	discordClient := discord.NewClient(os.Getenv("DISCORD_BOT_TOKEN"))
 
 	if err := (&controller.ShopReconciler{
 		Client: mgr.GetClient(),
@@ -74,9 +74,10 @@ func main() {
 	}
 
 	if err := (&controller.DiscordChannelReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Discord: discordClient,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		DefaultGuildID: os.Getenv("DISCORD_GUILD_ID"),
+		Discord:        discordClient,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DiscordChannel")
 		os.Exit(1)

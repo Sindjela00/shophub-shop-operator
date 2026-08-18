@@ -14,6 +14,13 @@ type DiscordChannelSpec struct {
 	// ChannelName is the desired Discord channel name for this shop's alert notifications.
 	// +kubebuilder:validation:MinLength=1
 	ChannelName string `json:"channelName"`
+
+	// GuildID is the Discord server (guild) this channel should be created in — the shop
+	// owner's own server, once they've invited the bot to it. Left empty, the reconciler falls
+	// back to the operator's own default guild (DISCORD_GUILD_ID), which is also how
+	// shophub-app's own platform-level alert channel is provisioned (it never sets this field).
+	// +optional
+	GuildID string `json:"guildId,omitempty"`
 }
 
 // DiscordChannelStatus defines the observed state of DiscordChannel.
