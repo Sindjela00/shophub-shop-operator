@@ -152,6 +152,13 @@ func (r *ShopReconciler) reconcileService(ctx context.Context, shop *shopv1.Shop
 		// built.
 		svc.ObjectMeta.Labels = labels
 		svc.Spec.Selector = labels
+		// NodePort, not the ClusterIP default: each shop needs a directly-reachable address of
+		// its own (shophub-app's ShopSiteUrlService reads the allocated port back) rather than
+		// being reachable only cluster-internally. Leaving Ports[0].NodePort unset (0) is
+		// intentional — Kubernetes' Service update strategy auto-fills an unset NodePort from
+		// the previously-stored object, so an already-allocated port stays stable across every
+		// future reconcile; only first creation gets a fresh one from the cluster's range.
+		svc.Spec.Type = corev1.ServiceTypeNodePort
 		svc.Spec.Ports = []corev1.ServicePort{
 			{Name: "http", Port: 80, TargetPort: intstr.FromInt32(shopContainerPort)},
 		}
