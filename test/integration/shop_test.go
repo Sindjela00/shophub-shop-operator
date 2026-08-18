@@ -48,6 +48,16 @@ func TestShopReconciliation_standardTierDeploysTwoReplicasAndACNPGCluster(t *tes
 	eventually(t, 5*time.Second, func() bool {
 		return k8sClient.Get(ctx, client.ObjectKeyFromObject(shop), &svc) == nil
 	})
+	// Unlike the fake-client unit test, envtest runs a real apiserver, which is what actually
+	// allocates NodePort values (apiserver REST storage strategy, not a separate controller) —
+	// this is the one place that can prove a real port got allocated, not just that the
+	// operator asked for NodePort.
+	if svc.Spec.Type != corev1.ServiceTypeNodePort {
+		t.Errorf("service type = %v, want NodePort", svc.Spec.Type)
+	}
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].NodePort == 0 {
+		t.Errorf("service ports = %+v, want a single port with a real allocated NodePort", svc.Spec.Ports)
+	}
 
 	cluster := &unstructured.Unstructured{}
 	cluster.SetGroupVersionKind(cnpgClusterGVK)

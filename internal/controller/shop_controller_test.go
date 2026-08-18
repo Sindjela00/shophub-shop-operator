@@ -105,6 +105,12 @@ func TestShopReconciler_createsServiceRoutingToTheDeployment(t *testing.T) {
 	if svc.Labels["app.kubernetes.io/name"] != "shophub-shop" || svc.Labels["app.kubernetes.io/instance"] != "shop-1" {
 		t.Errorf("service labels = %v, want app.kubernetes.io/name=shophub-shop and app.kubernetes.io/instance=shop-1", svc.Labels)
 	}
+	// The fake client doesn't run real apiserver NodePort allocation, so this only checks that
+	// the operator asks for NodePort — a real allocated port number is checked by the envtest
+	// integration suite instead (test/integration/shop_test.go), which runs a real apiserver.
+	if svc.Spec.Type != corev1.ServiceTypeNodePort {
+		t.Errorf("service type = %v, want NodePort", svc.Spec.Type)
+	}
 }
 
 func TestShopReconciler_standardDatabaseKindCreatesCNPGCluster(t *testing.T) {
