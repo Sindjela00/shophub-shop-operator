@@ -20,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -31,7 +33,15 @@ import (
 
 	shopv1 "github.com/shophub/shophub-shop-operator/api/v1"
 	"github.com/shophub/shophub-shop-operator/internal/controller"
-	"github.com/shophub/shophub-shop-operator/internal/discord"
+)
+
+// Stands in for shophub-helm-charts/charts/shophub's own Secret in this envtest cluster — see
+// the discordSecret creation below.
+const (
+	discordSecretNamespace = "default"
+	discordSecretName      = "shophub-discord"
+	discordBotTokenKey     = "DISCORD_BOT_TOKEN"
+	discordGuildIDKey      = "DISCORD_GUILD_ID"
 )
 
 var (
@@ -76,6 +86,22 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	// Stands in for the shophub chart's own Secret — the reconciler reads Discord credentials
+	// live via the Kubernetes API rather than holding a fixed discord.Client, so this needs a
+	// real object in the envtest API server (unlike the fake-client unit tests, which just seed
+	// an in-memory object set).
+	discordSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: discordSecretName, Namespace: discordSecretNamespace},
+		StringData: map[string]string{
+			discordBotTokenKey: "test-token",
+			discordGuildIDKey:  "test-guild",
+		},
+	}
+	if err := k8sClient.Create(context.Background(), discordSecret); err != nil {
+		fmt.Fprintln(os.Stderr, "discord credentials secret creation failed:", err)
+		os.Exit(1)
+	}
+
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:  scheme,
 		Metrics: metricsserver.Options{BindAddress: "0"},
@@ -95,10 +121,13 @@ func TestMain(m *testing.M) {
 	}
 	discordTestData = newFakeDiscordTransport()
 	if err := (&controller.DiscordChannelReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		DefaultGuildID: "test-guild",
-		Discord:        &discord.Client{HTTPClient: &http.Client{Transport: discordTestData}, BotToken: "test-token"},
+		Client:                   mgr.GetClient(),
+		Scheme:                   mgr.GetScheme(),
+		HTTPClient:               &http.Client{Transport: discordTestData},
+		DiscordSecretNamespace:   discordSecretNamespace,
+		DiscordSecretName:        discordSecretName,
+		DiscordSecretBotTokenKey: discordBotTokenKey,
+		DiscordSecretGuildIdKey:  discordGuildIDKey,
 	}).SetupWithManager(mgr); err != nil {
 		fmt.Fprintln(os.Stderr, "discordchannel controller setup failed:", err)
 		os.Exit(1)

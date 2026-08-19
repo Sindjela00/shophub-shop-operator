@@ -15,8 +15,15 @@ import (
 
 	shopv1 "github.com/shophub/shophub-shop-operator/api/v1"
 	"github.com/shophub/shophub-shop-operator/internal/controller"
-	"github.com/shophub/shophub-shop-operator/internal/discord"
 )
+
+// envOrDefault returns the named env var, or fallback if it's unset/empty.
+func envOrDefault(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
+}
 
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
@@ -55,8 +62,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	discordClient := discord.NewClient(os.Getenv("DISCORD_BOT_TOKEN"))
-
 	if err := (&controller.ShopReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -74,10 +79,12 @@ func main() {
 	}
 
 	if err := (&controller.DiscordChannelReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		DefaultGuildID: os.Getenv("DISCORD_GUILD_ID"),
-		Discord:        discordClient,
+		Client:                   mgr.GetClient(),
+		Scheme:                   mgr.GetScheme(),
+		DiscordSecretNamespace:   os.Getenv("DISCORD_SECRET_NAMESPACE"),
+		DiscordSecretName:        os.Getenv("DISCORD_SECRET_NAME"),
+		DiscordSecretBotTokenKey: envOrDefault("DISCORD_SECRET_BOT_TOKEN_KEY", "DISCORD_BOT_TOKEN"),
+		DiscordSecretGuildIdKey:  envOrDefault("DISCORD_SECRET_GUILD_ID_KEY", "DISCORD_GUILD_ID"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DiscordChannel")
 		os.Exit(1)
