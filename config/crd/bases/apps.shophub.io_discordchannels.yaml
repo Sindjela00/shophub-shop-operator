@@ -51,6 +51,13 @@ spec:
                   shop's alert notifications.
                 minLength: 1
                 type: string
+              guildId:
+                description: |-
+                  GuildID is the Discord server (guild) this channel should be created in — the shop
+                  owner's own server, once they've invited the bot to it. Left empty, the reconciler falls
+                  back to the operator's own default guild (DISCORD_GUILD_ID), which is also how
+                  shophub-app's own platform-level alert channel is provisioned (it never sets this field).
+                type: string
               shopRef:
                 description: ShopRef is the name of the owning Shop resource, in the
                   same namespace.
