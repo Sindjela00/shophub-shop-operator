@@ -95,9 +95,10 @@ func TestMain(m *testing.M) {
 	}
 	discordTestData = newFakeDiscordTransport()
 	if err := (&controller.DiscordChannelReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Discord: &discord.Client{HTTPClient: &http.Client{Transport: discordTestData}, BotToken: "test-token", GuildID: "test-guild"},
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		DefaultGuildID: "test-guild",
+		Discord:        &discord.Client{HTTPClient: &http.Client{Transport: discordTestData}, BotToken: "test-token"},
 	}).SetupWithManager(mgr); err != nil {
 		fmt.Fprintln(os.Stderr, "discordchannel controller setup failed:", err)
 		os.Exit(1)
@@ -256,6 +257,13 @@ func (f *fakeDiscordTransport) RoundTrip(req *http.Request) (*http.Response, err
 		}
 		b.WriteByte(']')
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(b.String()))}, nil
+
+	case req.Method == http.MethodPost && strings.HasPrefix(req.URL.Path, "/api/v10/channels/") && strings.HasSuffix(req.URL.Path, "/messages"):
+		channelID := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/api/v10/channels/"), "/messages")
+		if _, ok := f.channels[channelID]; !ok {
+			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(`{"message":"Unknown Channel"}`))}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"id":"msg-1"}`))}, nil
 
 	case req.Method == http.MethodPost:
 		var reqBody struct {
