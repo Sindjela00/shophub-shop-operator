@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,6 +124,53 @@ func TestShopCRD_rejectsInvalidAvailability(t *testing.T) {
 	if err := k8sClient.Create(ctx, shop); err == nil {
 		t.Fatal("expected the API server to reject an invalid availability value, got no error")
 	}
+}
+
+// TestShopReconciliation_reflectsAnInvalidWallet exercises the real ShopReconciler and
+// WalletReconciler together against a real apiserver: a Shop whose Wallet CR (named the same
+// as the Shop, per the shophub-app provisioning convention — see
+// config/samples/apps_v1_wallet.yaml) has an invalid payout address must never settle into
+// Ready, and its Ready condition should say why. Note envtest has no Deployment/ReplicaSet
+// controller, so deployment.status.readyReplicas never advances here either — this test can't
+// distinguish "blocked by the wallet" from "blocked because nothing ever rolls out" via phase
+// alone, so it asserts on the condition message instead, which is set unconditionally.
+func TestShopReconciliation_reflectsAnInvalidWallet(t *testing.T) {
+	ctx := context.Background()
+	shop := &shopv1.Shop{
+		ObjectMeta: metav1.ObjectMeta{Name: "shop-it-bad-wallet", Namespace: "default"},
+		Spec: shopv1.ShopSpec{
+			Name:          "IT Bad Wallet Shop",
+			Availability:  shopv1.ShopAvailabilityStandard,
+			WalletAddress: "not-an-address",
+			DatabaseKind:  shopv1.ShopDatabaseKindStandard,
+		},
+	}
+	if err := k8sClient.Create(ctx, shop); err != nil {
+		t.Fatalf("create shop: %v", err)
+	}
+	wallet := &shopv1.Wallet{
+		ObjectMeta: metav1.ObjectMeta{Name: shop.Name, Namespace: shop.Namespace},
+		Spec:       shopv1.WalletSpec{ShopRef: shop.Name, Address: shop.Spec.WalletAddress},
+	}
+	if err := k8sClient.Create(ctx, wallet); err != nil {
+		t.Fatalf("create wallet: %v", err)
+	}
+
+	eventually(t, 10*time.Second, func() bool {
+		var got shopv1.Shop
+		if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(shop), &got); err != nil {
+			return false
+		}
+		if got.Status.Phase == shopv1.ShopPhaseReady {
+			t.Fatalf("shop settled into Ready with an invalid Wallet: %+v", got.Status)
+		}
+		for _, c := range got.Status.Conditions {
+			if c.Type == "Ready" {
+				return c.Status == metav1.ConditionFalse && strings.Contains(c.Message, "Wallet")
+			}
+		}
+		return false
+	})
 }
 
 func TestShopCRD_rejectsMissingWalletAddress(t *testing.T) {
