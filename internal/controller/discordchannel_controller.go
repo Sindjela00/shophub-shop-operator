@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -35,17 +36,37 @@ const discordChannelFinalizer = "apps.shophub.io/discordchannel-cleanup"
 type DiscordChannelReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
-	// DefaultGuildID is used for any DiscordChannel whose own Spec.GuildID is empty — the
-	// operator's own configured guild (DISCORD_GUILD_ID), which is how shophub-app's own
-	// platform alert channel and any not-yet-attached shop's channel are provisioned.
-	DefaultGuildID string
-	Discord        *discord.Client
+	// HTTPClient is passed through to the discord.Client built fresh on every reconcile (see
+	// loadDiscordCredentials) — nil uses http.DefaultClient, same fallback discord.Client
+	// already has internally. Only worth setting explicitly in tests, to swap in a fake
+	// Transport.
+	HTTPClient *http.Client
+	// The bot token/default guild ID live in a Secret this operator doesn't own — the shophub
+	// chart's own Secret, since it's shophub-app's credential too (its bot-invite/verify
+	// onboarding flow). Read live via the Kubernetes API on every reconcile rather than injected
+	// into this process's own env, so a token rotation or a Secret created after this operator
+	// started (e.g. shophub installed later) takes effect without a restart. Cross-namespace
+	// (DiscordSecretNamespace is normally "shophub", this operator runs in "shops") works with
+	// zero extra RBAC beyond what this file already needs — see the secrets rule below, which
+	// is a ClusterRole, not a namespaced Role.
+	DiscordSecretNamespace   string
+	DiscordSecretName        string
+	DiscordSecretBotTokenKey string
+	DiscordSecretGuildIdKey  string
 }
 
 // +kubebuilder:rbac:groups=apps.shophub.io,resources=discordchannels,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=apps.shophub.io,resources=discordchannels/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=alertmanagerconfigs,verbs=get;list;watch;create;update;patch
+//
+// The secrets rule above covers two different things: creating/updating each DiscordChannel's
+// own per-channel webhook Secret in this namespace (the usual case for a namespaced Role), and
+// — because this project deploys it as a cluster-wide ClusterRole+ClusterRoleBinding rather
+// than a namespaced Role+RoleBinding (see shophub-helm-charts/charts/shop-operator/templates/
+// clusterrole.yaml) — reading the Discord bot token Secret live from a *different* namespace
+// (DiscordSecretNamespace) in loadDiscordCredentials below. No separate RBAC grant was needed
+// to add that cross-namespace read.
 
 func webhookSecretName(dc *shopv1.DiscordChannel) string {
 	return dc.Name + "-discord-webhook"
@@ -59,8 +80,19 @@ func (r *DiscordChannelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	discordClient, defaultGuildID, err := r.loadDiscordCredentials(ctx)
+	if err != nil {
+		if !dc.DeletionTimestamp.IsZero() {
+			// Can't reach Discord to clean up — leave the finalizer in place and retry later,
+			// the same tolerance reconcileDelete already has for any other Discord API failure
+			// during cleanup.
+			return ctrl.Result{}, err
+		}
+		return r.markFailed(ctx, &dc, err)
+	}
+
 	if !dc.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, &dc)
+		return r.reconcileDelete(ctx, &dc, discordClient)
 	}
 
 	if !controllerutil.ContainsFinalizer(&dc, discordChannelFinalizer) {
@@ -74,14 +106,14 @@ func (r *DiscordChannelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	guildID := dc.Spec.GuildID
 	if guildID == "" {
-		guildID = r.DefaultGuildID
+		guildID = defaultGuildID
 	}
 
 	// Idempotent: if we already recorded a channel ID, confirm it's still there rather than
 	// blindly assuming a new one is needed (e.g. after a manager restart).
 	var channel *discord.Channel
 	if dc.Status.ChannelID != "" {
-		existing, err := r.Discord.GetChannel(ctx, dc.Status.ChannelID)
+		existing, err := discordClient.GetChannel(ctx, dc.Status.ChannelID)
 		if err != nil {
 			return r.markFailed(ctx, &dc, err)
 		}
@@ -94,13 +126,13 @@ func (r *DiscordChannelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if channel == nil {
 		// Guard against duplicate creation if a previous reconcile created the channel but
 		// failed before persisting status.channelId.
-		found, err := r.Discord.FindChannelByName(ctx, guildID, name)
+		found, err := discordClient.FindChannelByName(ctx, guildID, name)
 		if err != nil {
 			return r.markFailed(ctx, &dc, err)
 		}
 		channel = found
 		if channel == nil {
-			channel, err = r.Discord.CreateChannel(ctx, guildID, name)
+			channel, err = discordClient.CreateChannel(ctx, guildID, name)
 			if err != nil {
 				return r.markFailed(ctx, &dc, err)
 			}
@@ -115,19 +147,19 @@ func (r *DiscordChannelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// this branch, so there's no need for a separate "already welcomed" status field.
 	if justCreated {
 		welcome := fmt.Sprintf("👋 This channel will receive alert notifications for **%s**.", name)
-		if err := r.Discord.SendMessage(ctx, channel.ID, welcome); err != nil {
+		if err := discordClient.SendMessage(ctx, channel.ID, welcome); err != nil {
 			logger.Error(err, "failed to send welcome message", "channel", name, "channelId", channel.ID)
 		}
 	}
 
 	// Same idempotency pattern for the webhook Alertmanager will post through: look it up by
 	// name before creating, so repeated reconciles never pile up duplicate webhooks.
-	webhook, err := r.Discord.FindChannelWebhookByName(ctx, channel.ID, name)
+	webhook, err := discordClient.FindChannelWebhookByName(ctx, channel.ID, name)
 	if err != nil {
 		return r.markFailed(ctx, &dc, err)
 	}
 	if webhook == nil {
-		webhook, err = r.Discord.CreateChannelWebhook(ctx, channel.ID, name)
+		webhook, err = discordClient.CreateChannelWebhook(ctx, channel.ID, name)
 		if err != nil {
 			return r.markFailed(ctx, &dc, err)
 		}
@@ -207,19 +239,19 @@ func (r *DiscordChannelReconciler) reconcileAlertmanagerConfig(ctx context.Conte
 	return err
 }
 
-func (r *DiscordChannelReconciler) reconcileDelete(ctx context.Context, dc *shopv1.DiscordChannel) (ctrl.Result, error) {
+func (r *DiscordChannelReconciler) reconcileDelete(ctx context.Context, dc *shopv1.DiscordChannel, discordClient *discord.Client) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(dc, discordChannelFinalizer) {
 		return ctrl.Result{}, nil
 	}
 
 	if dc.Status.WebhookID != "" {
-		if err := r.Discord.DeleteWebhook(ctx, dc.Status.WebhookID); err != nil {
+		if err := discordClient.DeleteWebhook(ctx, dc.Status.WebhookID); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
 	if dc.Status.ChannelID != "" {
-		if err := r.Discord.DeleteChannel(ctx, dc.Status.ChannelID); err != nil {
+		if err := discordClient.DeleteChannel(ctx, dc.Status.ChannelID); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -229,6 +261,20 @@ func (r *DiscordChannelReconciler) reconcileDelete(ctx context.Context, dc *shop
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+// loadDiscordCredentials fetches the bot token and default guild ID from the shophub chart's
+// own Secret and builds a Client from it — see the DiscordSecretNamespace field's doc comment
+// for why this is read live on every reconcile instead of held on the reconciler.
+func (r *DiscordChannelReconciler) loadDiscordCredentials(ctx context.Context) (*discord.Client, string, error) {
+	key := client.ObjectKey{Namespace: r.DiscordSecretNamespace, Name: r.DiscordSecretName}
+	var secret corev1.Secret
+	if err := r.Get(ctx, key, &secret); err != nil {
+		return nil, "", fmt.Errorf("reading Discord bot token secret %s: %w", key, err)
+	}
+	token := string(secret.Data[r.DiscordSecretBotTokenKey])
+	guildID := string(secret.Data[r.DiscordSecretGuildIdKey])
+	return &discord.Client{HTTPClient: r.HTTPClient, BotToken: token}, guildID, nil
 }
 
 func (r *DiscordChannelReconciler) markFailed(ctx context.Context, dc *shopv1.DiscordChannel, cause error) (ctrl.Result, error) {
