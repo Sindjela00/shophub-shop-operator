@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -276,6 +277,114 @@ func TestShopReconciler_provisionsAnAdminKeySecretWiredIntoTheDeployment(t *test
 	}
 	if found.ValueFrom.SecretKeyRef.Name != "shop-1-admin-key" || found.ValueFrom.SecretKeyRef.Key != "apiKey" {
 		t.Errorf("Admin__ApiKey secretKeyRef = %+v, want name=shop-1-admin-key key=apiKey", found.ValueFrom.SecretKeyRef)
+	}
+}
+
+// newReadyDeployment pre-seeds a Deployment whose status already reports every replica ready —
+// the fake client (unlike a real apiserver) never runs an actual rollout, so a test that wants
+// to see the Shop settle into Ready has to fake that status itself. reconcileDeployment's
+// CreateOrUpdate only ever touches Spec fields (see shop_controller.go), so this pre-set Status
+// round-trips through Reconcile untouched.
+func newReadyDeployment(shop *shopv1.Shop, readyReplicas int32) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: shop.Name, Namespace: shop.Namespace},
+		Status:     appsv1.DeploymentStatus{ReadyReplicas: readyReplicas},
+	}
+}
+
+// newWallet builds the Wallet CR for shop, named the same as the Shop per the shophub-app
+// provisioning convention (see config/samples/apps_v1_wallet.yaml and walletReadiness's doc
+// comment), with its Ready condition already set the way WalletReconciler would leave it.
+func newWallet(shop *shopv1.Shop, ready bool, reason, message string) *shopv1.Wallet {
+	status := metav1.ConditionFalse
+	if ready {
+		status = metav1.ConditionTrue
+	}
+	return &shopv1.Wallet{
+		ObjectMeta: metav1.ObjectMeta{Name: shop.Name, Namespace: shop.Namespace},
+		Spec:       shopv1.WalletSpec{ShopRef: shop.Name, Address: shop.Spec.WalletAddress},
+		Status: shopv1.WalletStatus{
+			Conditions: []metav1.Condition{
+				{Type: "Ready", Status: status, Reason: reason, Message: message},
+			},
+		},
+	}
+}
+
+func reconcileShopWithObjects(t *testing.T, objs ...client.Object) (client.Client, *shopv1.Shop) {
+	t.Helper()
+	scheme := newShopTestScheme(t)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithStatusSubresource(&shopv1.Shop{}).
+		Build()
+
+	r := &ShopReconciler{Client: fakeClient, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "shop-1", Namespace: "shops"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile returned error: %v", err)
+	}
+
+	var got shopv1.Shop
+	if err := fakeClient.Get(context.Background(), req.NamespacedName, &got); err != nil {
+		t.Fatalf("Get shop returned error: %v", err)
+	}
+	return fakeClient, &got
+}
+
+func TestShopReconciler_settlesReadyWhenDeploymentRolledOutAndWalletIsReady(t *testing.T) {
+	shop := newShop(shopv1.ShopAvailabilityStandard, shopv1.ShopDatabaseKindStandard)
+	wallet := newWallet(shop, true, "AddressValid", "Payout address is a well-formed Ethereum address.")
+	deployment := newReadyDeployment(shop, 2)
+
+	_, got := reconcileShopWithObjects(t, shop, wallet, deployment)
+
+	if got.Status.Phase != shopv1.ShopPhaseReady {
+		t.Errorf("phase = %v, want %v", got.Status.Phase, shopv1.ShopPhaseReady)
+	}
+	cond := findCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Errorf("Ready condition = %+v, want status True", cond)
+	}
+}
+
+func TestShopReconciler_doesNotSettleReadyWhenWalletIsInvalid(t *testing.T) {
+	shop := newShop(shopv1.ShopAvailabilityStandard, shopv1.ShopDatabaseKindStandard)
+	walletMessage := "not a valid Ethereum address: expected 0x followed by 40 hex characters"
+	wallet := newWallet(shop, false, "InvalidAddress", walletMessage)
+	deployment := newReadyDeployment(shop, 2)
+
+	_, got := reconcileShopWithObjects(t, shop, wallet, deployment)
+
+	if got.Status.Phase == shopv1.ShopPhaseReady {
+		t.Errorf("phase = %v, want the shop to NOT be Ready while its Wallet is invalid", got.Status.Phase)
+	}
+	cond := findCondition(got.Status.Conditions, "Ready")
+	if cond == nil {
+		t.Fatal("expected a Ready condition, found none")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("Ready condition status = %s, want False", cond.Status)
+	}
+	if !strings.Contains(cond.Message, walletMessage) {
+		t.Errorf("Ready condition message = %q, want it to reference the wallet's own message %q", cond.Message, walletMessage)
+	}
+}
+
+func TestShopReconciler_doesNotSettleReadyWhenWalletIsMissing(t *testing.T) {
+	shop := newShop(shopv1.ShopAvailabilityStandard, shopv1.ShopDatabaseKindStandard)
+	deployment := newReadyDeployment(shop, 2)
+
+	// Deliberately no Wallet object created.
+	_, got := reconcileShopWithObjects(t, shop, deployment)
+
+	if got.Status.Phase == shopv1.ShopPhaseReady {
+		t.Errorf("phase = %v, want the shop to NOT be Ready with no Wallet at all", got.Status.Phase)
+	}
+	cond := findCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Errorf("Ready condition = %+v, want status False", cond)
 	}
 }
 
