@@ -138,21 +138,46 @@ func jsonResp(status int, body any) *http.Response {
 	return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(string(data)))}
 }
 
+// testDiscordSecretNamespace/Name/keys match what shophub-helm-charts/charts/shop-operator's
+// default values.yaml points shop-operator at in production — kept as named constants here so
+// the "secret missing" test below can reference the same name/namespace without repeating it.
+const (
+	testDiscordSecretNamespace = "shophub"
+	testDiscordSecretName      = "shophub-discord"
+	testDiscordBotTokenKey     = "DISCORD_BOT_TOKEN"
+	testDiscordGuildIDKey      = "DISCORD_GUILD_ID"
+)
+
 func newDiscordReconciler(t *testing.T, transport *recordingDiscordTransport, dc *shopv1.DiscordChannel) (*DiscordChannelReconciler, client.Client) {
 	t.Helper()
 	scheme := newShopTestScheme(t)
+
+	// Stands in for the shophub chart's own Secret — the reconciler now reads credentials live
+	// via the Kubernetes API instead of holding a fixed discord.Client, so tests seed this
+	// instead of constructing one directly.
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: testDiscordSecretName, Namespace: testDiscordSecretNamespace},
+		Data: map[string][]byte{
+			testDiscordBotTokenKey: []byte("test-token"),
+			testDiscordGuildIDKey:  []byte("test-guild"),
+		},
+	}
+
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(dc).
+		WithObjects(dc, secret).
 		WithStatusSubresource(&shopv1.DiscordChannel{}).
 		Build()
 
-	discordClient := &discord.Client{
-		HTTPClient: &http.Client{Transport: transport},
-		BotToken:   "test-token",
+	r := &DiscordChannelReconciler{
+		Client:                   fakeClient,
+		Scheme:                   scheme,
+		HTTPClient:               &http.Client{Transport: transport},
+		DiscordSecretNamespace:   testDiscordSecretNamespace,
+		DiscordSecretName:        testDiscordSecretName,
+		DiscordSecretBotTokenKey: testDiscordBotTokenKey,
+		DiscordSecretGuildIdKey:  testDiscordGuildIDKey,
 	}
-
-	r := &DiscordChannelReconciler{Client: fakeClient, Scheme: scheme, DefaultGuildID: "test-guild", Discord: discordClient}
 	return r, fakeClient
 }
 
@@ -364,6 +389,43 @@ func TestDiscordChannelReconciler_isIdempotentForWebhookCreationAcrossReconciles
 	}
 	if webhookCreates != 1 {
 		t.Errorf("webhook created %d times across repeated reconciles, want 1: %v", webhookCreates, transport.Requests)
+	}
+}
+
+func TestDiscordChannelReconciler_marksFailedWhenTheCredentialsSecretIsMissing(t *testing.T) {
+	scheme := newShopTestScheme(t)
+	dc := newDiscordChannel()
+	// No Secret seeded this time — simulates the shophub chart not being installed yet, or the
+	// two charts' secretName/secretNamespace values having drifted out of sync.
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(dc).
+		WithStatusSubresource(&shopv1.DiscordChannel{}).
+		Build()
+	r := &DiscordChannelReconciler{
+		Client:                   fakeClient,
+		Scheme:                   scheme,
+		DiscordSecretNamespace:   testDiscordSecretNamespace,
+		DiscordSecretName:        testDiscordSecretName,
+		DiscordSecretBotTokenKey: testDiscordBotTokenKey,
+		DiscordSecretGuildIdKey:  testDiscordGuildIDKey,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "shop-1", Namespace: "shops"}}
+	if _, err := r.Reconcile(context.Background(), req); err == nil {
+		t.Fatal("expected Reconcile to return an error when the credentials Secret is missing")
+	}
+
+	var got shopv1.DiscordChannel
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1", Namespace: "shops"}, &got); err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	cond := findCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Errorf("Ready condition = %+v, want False", cond)
+	}
+	if cond != nil && !strings.Contains(cond.Message, testDiscordSecretName) {
+		t.Errorf("condition message %q doesn't reference the missing secret name %q", cond.Message, testDiscordSecretName)
 	}
 }
 
