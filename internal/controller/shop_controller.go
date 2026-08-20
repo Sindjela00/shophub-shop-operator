@@ -9,16 +9,20 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	shopv1 "github.com/shophub/shophub-shop-operator/api/v1"
 )
@@ -52,6 +56,7 @@ type ShopReconciler struct {
 
 // +kubebuilder:rbac:groups=apps.shophub.io,resources=shops,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps.shophub.io,resources=shops/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=apps.shophub.io,resources=wallets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
@@ -88,18 +93,29 @@ func (r *ShopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	wantReplicas := replicasFor(shop.Spec.Availability)
-	ready := deployment.Status.ReadyReplicas == wantReplicas
+	deploymentReady := deployment.Status.ReadyReplicas == wantReplicas
+
+	walletReady, walletMessage, err := r.walletReadiness(ctx, &shop)
+	if err != nil {
+		return r.markFailed(ctx, &shop, fmt.Errorf("wallet: %w", err))
+	}
+
+	ready := deploymentReady && walletReady
 
 	phase := shopv1.ShopPhasePending
 	if ready {
 		phase = shopv1.ShopPhaseReady
 	}
 	shop.Status.Phase = phase
+	message := fmt.Sprintf("%d/%d replicas ready", deployment.Status.ReadyReplicas, wantReplicas)
+	if !walletReady {
+		message = fmt.Sprintf("%s; waiting on Wallet to become Ready: %s", message, walletMessage)
+	}
 	apimeta.SetStatusCondition(&shop.Status.Conditions, metav1.Condition{
 		Type:    "Ready",
 		Status:  conditionStatusFor(ready),
 		Reason:  "Reconciled",
-		Message: fmt.Sprintf("%d/%d replicas ready", deployment.Status.ReadyReplicas, wantReplicas),
+		Message: message,
 	})
 	if err := r.Status().Update(ctx, &shop); err != nil {
 		return ctrl.Result{}, err
@@ -137,6 +153,35 @@ func (r *ShopReconciler) reconcileDeployment(ctx context.Context, shop *shopv1.S
 		return nil, err
 	}
 	return deployment, nil
+}
+
+// walletReadiness reports whether the Wallet CR backing this Shop's payout address is itself
+// Ready. shophub-app provisions Shop and Wallet CRs independently (see README's "shophub-app —
+// creates Shop/DiscordChannel/Wallet custom resources via its admin panel"), naming the Wallet
+// the same as its owning Shop (config/samples/apps_v1_wallet.yaml: metadata.name ==
+// spec.shopRef == the Shop's name) — the same convention WalletReconciler and its tests already
+// rely on — so no separate ref field is needed to look it up here.
+//
+// A missing Wallet is reported as not-ready rather than as a reconcile error: a brand-new Shop
+// can briefly exist before shophub-app has finished creating its Wallet, and that's a normal
+// transient state, not a failure of this controller.
+func (r *ShopReconciler) walletReadiness(ctx context.Context, shop *shopv1.Shop) (ready bool, message string, err error) {
+	var wallet shopv1.Wallet
+	if getErr := r.Get(ctx, client.ObjectKey{Name: shop.Name, Namespace: shop.Namespace}, &wallet); getErr != nil {
+		if apierrors.IsNotFound(getErr) {
+			return false, "wallet not found", nil
+		}
+		return false, "", getErr
+	}
+
+	cond := apimeta.FindStatusCondition(wallet.Status.Conditions, "Ready")
+	if cond == nil {
+		return false, "wallet has not been reconciled yet", nil
+	}
+	if cond.Status != metav1.ConditionTrue {
+		return false, cond.Message, nil
+	}
+	return true, "", nil
 }
 
 func (r *ShopReconciler) reconcileService(ctx context.Context, shop *shopv1.Shop) error {
@@ -267,6 +312,19 @@ func (r *ShopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&shopv1.Shop{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		// Not an owner reference — ShopReconciler doesn't create the Wallet (shophub-app does,
+		// see walletReadiness's doc comment) — but Shop readiness now depends on the Wallet's
+		// own status, so a Wallet transitioning Ready (e.g. after its address is corrected)
+		// needs to trigger a Shop re-reconcile too, not just wait for the next incidental one.
+		Watches(
+			&shopv1.Wallet{},
+			handler.EnqueueRequestsFromMapFunc(func(_ context.Context, wallet client.Object) []reconcile.Request {
+				return []reconcile.Request{{NamespacedName: types.NamespacedName{
+					Name:      wallet.GetName(),
+					Namespace: wallet.GetNamespace(),
+				}}}
+			}),
+		).
 		Complete(r)
 }
 
