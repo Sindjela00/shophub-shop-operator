@@ -195,7 +195,7 @@ func TestShopReconciler_standardDatabaseKindWiresConnectionStringFromCNPGSecret(
 	}
 }
 
-func TestShopReconciler_lightDatabaseKindDoesNotSetConnectionString(t *testing.T) {
+func TestShopReconciler_lightDatabaseKindWiresRedisConnectionStringOnly(t *testing.T) {
 	fakeClient, _ := reconcileShop(t, newShop(shopv1.ShopAvailabilityStandard, shopv1.ShopDatabaseKindLight))
 
 	var deployment appsv1.Deployment
@@ -203,9 +203,38 @@ func TestShopReconciler_lightDatabaseKindDoesNotSetConnectionString(t *testing.T
 		t.Fatalf("Get deployment returned error: %v", err)
 	}
 
+	byName := map[string]corev1.EnvVar{}
 	for _, e := range deployment.Spec.Template.Spec.Containers[0].Env {
-		if e.Name == "ConnectionStrings__Default" {
-			t.Errorf("ConnectionStrings__Default should not be set for the light/Redis tier, got %+v", e)
+		byName[e.Name] = e
+	}
+
+	// Exactly one of the two connection strings decides the tier at runtime (see shophub-shop's
+	// Program.cs) — setting both would make that choice ambiguous.
+	if e, ok := byName["ConnectionStrings__Default"]; ok {
+		t.Errorf("ConnectionStrings__Default should not be set for the light/Redis tier, got %+v", e)
+	}
+
+	conn, ok := byName["ConnectionStrings__Redis"]
+	if !ok {
+		t.Fatal("ConnectionStrings__Redis env var not set for the light/Redis tier")
+	}
+	// The Redis CR's own Service, in the shop's namespace — a bare name resolves via cluster DNS.
+	if conn.Value != "shop-1-db:6379" {
+		t.Errorf("ConnectionStrings__Redis = %q, want %q", conn.Value, "shop-1-db:6379")
+	}
+}
+
+func TestShopReconciler_standardDatabaseKindDoesNotSetRedisConnectionString(t *testing.T) {
+	fakeClient, _ := reconcileShop(t, newShop(shopv1.ShopAvailabilityStandard, shopv1.ShopDatabaseKindStandard))
+
+	var deployment appsv1.Deployment
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "shop-1", Namespace: "shops"}, &deployment); err != nil {
+		t.Fatalf("Get deployment returned error: %v", err)
+	}
+
+	for _, e := range deployment.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "ConnectionStrings__Redis" {
+			t.Errorf("ConnectionStrings__Redis should not be set for the standard/Postgres tier, got %+v", e)
 		}
 	}
 }
