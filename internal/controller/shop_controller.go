@@ -36,6 +36,9 @@ const (
 
 	defaultRedisImage = "redis:7.2-alpine"
 	redisImageEnvVar  = "SHOP_REDIS_IMAGE"
+	// Standard Redis port — what OT-CONTAINER-KIT's redis-operator exposes on the Service it
+	// creates for a Redis CR, and what shophub-shop's StackExchange.Redis client connects to.
+	redisPort = 6379
 )
 
 var (
@@ -374,9 +377,12 @@ func redisImage() string {
 // CNPG's own "uri" key isn't in Npgsql's connection-string format, and there's no single
 // secret key already in that format to reference directly.
 //
-// The "light" (Redis) tier deliberately doesn't get a ConnectionStrings__Default: shophub-shop's
-// EF Core DbContext is Npgsql-only today, so there's no Redis-backed connection string this
-// controller could wire up that the app would actually use.
+// The "light" (Redis) tier gets ConnectionStrings__Redis instead — shophub-shop picks its
+// storage backend from whichever of the two connection strings is present (see that repo's
+// Program.cs), so setting exactly one of them is what actually selects the tier at runtime.
+// The Redis CR's Service is named after the CR itself and listens on the standard port, in the
+// shop's own namespace, so a bare service name resolves via cluster DNS — no generated secret
+// to compose this one out of, unlike CNPG's.
 //
 // Payments__ReceivingWalletAddress is the config key shophub-shop's PaymentOptions actually
 // binds (see that repo's PaymentOptions.ReceivingWalletAddress doc comment — it was written
@@ -396,7 +402,10 @@ func envFor(shop *shopv1.Shop) []corev1.EnvVar {
 		},
 	}
 	if shop.Spec.DatabaseKind == shopv1.ShopDatabaseKindLight {
-		return env
+		return append(env, corev1.EnvVar{
+			Name:  "ConnectionStrings__Redis",
+			Value: fmt.Sprintf("%s:%d", dbName(shop.Name), redisPort),
+		})
 	}
 
 	appSecret := dbName(shop.Name) + "-app"
